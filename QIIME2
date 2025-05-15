@@ -1,0 +1,73 @@
+#taxonomic profiling using QIIME2
+#acivate conda
+conda activate qiime2-2021.2
+nano manifest.tsv
+
+#Import Data Using Manifest File
+qiime tools import \
+  --type 'SampleData[SequencesWithQuality]' \
+  --input-path manifest.tsv \
+  --input-format SingleEndFastqManifestPhred33V2 \
+  --output-path demux.qza
+
+# Summarize Demultiplexed Data
+qiime demux summarize \
+  --i-data demux.qza \
+  --o-visualization demux-summary.qzv
+
+#Denoising with DADA2
+qiime dada2 denoise-single \
+  --i-demultiplexed-seqs demux.qza \
+  --p-trim-left 0 \
+  --p-trunc-len 227 \
+  --o-representative-sequences rep-seqs-dada2.qza \
+  --o-table table-dada2.qza \
+  --o-denoising-stats denoising-stats.qza
+
+#Summarize Denoising Stats
+qiime metadata tabulate \
+  --m-input-file denoising-stats.qza \
+  --o-visualization denoising-stats.qzv
+
+#Summarize Feature Table
+qiime feature-table summarize \
+  --i-table table-dada2.qza \
+  --o-visualization table.qzv \
+  --m-sample-metadata-file sample_metadatas.tsv
+
+  #Taxonomic Classification
+  qiime feature-classifier classify-sklearn   --i-classifier silva-138-99-515-806-nb-classifier.qza   --i-reads rep-seqs-dada2.qza   --o-classification taxonomy.qza
+
+  #Visualize Taxonomic Classification
+qiime metadata tabulate \
+  --m-input-file taxonomy.qza \
+  --o-visualization taxonomy.qzv
+
+# Create Taxa Bar Plot
+qiime taxa barplot \
+  --i-table table-dada2.qza \
+  --i-taxonomy taxonomy.qza \
+  --m-metadata-file sample_metadatas.tsv \
+  --o-visualization taxa-bar-plots.qzv
+
+#Alpha Diversity (Within-Sample Diversity)
+qiime diversity core-metrics-phylogenetic \
+  --i-phylogeny rooted-tree.qza \
+  --i-table table-dada2.qza \
+  --p-sampling-depth 3 \
+  --m-metadata-file sample_metadatas.tsv \
+  --output-dir core-metrics-results
+
+#Beta Diversity (Between-Sample Diversity)
+qiime diversity core-metrics-phylogenetic \
+  --i-phylogeny rooted-tree.qza \
+  --i-table table-dada2.qza \
+  --p-sampling-depth 3 \
+  --m-metadata-file sample_metadatas.tsv \
+  --output-dir core-metrics-results
+
+#Visualize Diversity Results (Principal Coordinates Analysis)
+qiime emperor plot \
+  --i-pcoa core-metrics-results/weighted_unifrac_pcoa_results.qza \
+  --m-metadata-file sample_metadatas.tsv \
+  --o-visualization core-metrics-results/weighted-unifrac-emperor.qzv
