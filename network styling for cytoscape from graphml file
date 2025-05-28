@@ -1,0 +1,72 @@
+# Install and load RCy3
+if (!requireNamespace("RCy3", quietly = TRUE)) {
+    BiocManager::install("RCy3")
+}
+library(RCy3)
+
+# 1. Start Cytoscape and check connection
+cytoscapePing()
+
+# 2. Import the GraphML network
+importNetworkFromFile("/home/hp/Desktop/RAJESWARI/new_correlation/top10_microbe_gene_network_stage1.graphml", "graphml")
+
+# 3. Define and create a visual style
+style.name <- "MicrobeGeneStyle"
+
+# Default settings
+defaults <- list(
+    NODE_SHAPE = "ellipse",
+    NODE_SIZE = 50,
+    NODE_FILL_COLOR = "#bbbbbb",
+    EDGE_WIDTH = 2,
+    EDGE_TRANSPARENCY = 180,
+    EDGE_STROKE_UNSELECTED_PAINT = "#888888"
+)
+
+# Node color based on type
+nodeColorMapping <- mapVisualProperty(
+    visual.property = "NODE_FILL_COLOR",
+    mapping.type = "d",
+    table.column = "type",
+    table.column.values = c("microbe", "gene"),
+    values = c("#377eb8", "#ff7f00")  # blue for microbe, orange for gene
+)
+
+# Node size based on type
+nodeSizeMapping <- mapVisualProperty(
+    visual.property = "NODE_SIZE",
+    mapping.type = "d",
+    table.column = "type",
+    table.column.values = c("microbe", "gene"),
+    values = c(120, 35)
+)
+
+# Edge color based on correlation (you must have 'color' column in edge table with hex values)
+edgeColorMapping <- mapVisualProperty(
+    visual.property = "EDGE_STROKE_UNSELECTED_PAINT",
+    mapping.type = "d",
+    table.column = "color",
+    table.column.values = c("#4daf4a", "#e41a1c"),  # green and red
+    values = c("#4daf4a", "#e41a1c")
+)
+
+# Edge width mapped by weight (correlation strength)
+edgeWidthMapping <- mapVisualProperty(
+    visual.property = "EDGE_WIDTH",
+    mapping.type = "p",
+    table.column = "weight"
+)
+
+# Create the visual style
+createVisualStyle(style.name, defaults, list(
+    nodeColorMapping, nodeSizeMapping, edgeColorMapping, edgeWidthMapping
+))
+
+# Apply the visual style
+setVisualStyle(style.name)
+
+# 4. Set node labels using the 'name' column
+setNodeLabelMapping("name")
+
+# 5. Fit the view and export the styled image
+fitContent()
