@@ -1,0 +1,182 @@
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(pheatmap)
+library(tidyverse)
+
+query <- GDCquery(project = "TCGA-LUAD",
+                  data.category = "Transcriptome Profiling",
+                  data.type = "Gene Expression Quantification",
+                  workflow.type = "STAR - Counts")
+GDCdownload(query)
+data <- GDCprepare(query)
+# load saved data
+data <- readRDS("/home/hp/tcga_luad_gene_expressionDATA.rds")
+Expression <- assay(data) 
+Expression <- data.frame(Expression)
+coldata <- colData(data) 
+coldata <- data.frame(coldata)
+Gene_metadata <- rowData(data)
+#DEG 
+library(DESeq2)
+library(tidyverse)
+# making sure the row names in colData matches to column names in Expression
+all(colnames(Expression) %in% rownames(coldata))
+# are they in the same order?
+all(colnames(Expression) == rownames(coldata))
+
+# construct a DESeqDataSet object ----------
+dds <- DESeqDataSetFromMatrix(countData = Expression,
+                              colData = coldata,
+                              design = ~ sample_type)
+# pre-filtering: removing rows with low gene counts
+# keeping rows that have at least 10 reads total
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+
+dds <- DESeq(dds)
+res <- results(dds)
+summary(res)
+saveRDS(res, file = "res.rds")
+
+# Convert to data frame and add gene_id
+res1 <- as.data.frame(res)
+res1$gene_id <- rownames(res1)
+saveRDS(res1, file = "res1.rds")
+# Add gene type and filter for protein coding
+res1$gene_type <- Gene_metadata$gene_type[match(res1$gene_id, Gene_metadata$gene_id)]
+res1 <- res1[res1$gene_type == "protein_coding", ]
+
+# Filter for significant genes
+res1_filtered <- res1[res1$padj < 0.05 & abs(res1$log2FoldChange) > 1, ]
+
+# Add gene name
+res1_filtered$gene_name <- Gene_metadata$gene_name[match(res1_filtered$gene_id, Gene_metadata$gene_id)]
+head(res1_filtered[order(res1_filtered$log2FoldChange, decreasing = TRUE), ], 10)  # Top upregulated
+#to save the top10 upregulated gene
+top_up <- head(res1_filtered[order(res1_filtered$log2FoldChange, decreasing = TRUE), ], 10)
+write.csv(top_up, file = "top10_upregulated_genes.csv", row.names = TRUE)
+#to save top10 down regulated genes
+head(res1_filtered[order(res1_filtered$log2FoldChange), ], 10)  # Top downregulated
+write.csv(top_down, file = "top10_downregulated_genes.csv", row.names = TRUE)
+
+write.csv(res1_filtered, "TCGA_LUAD_DEGs_filtered.csv", row.names = FALSE)
+saveRDS(res1_filtered, "TCGA_LUAD_DEGs_filtered.rds")
+
+# to save all upregulated and down regulated genes
+upregulated_genes <- res1_filtered[res1_filtered$log2FoldChange > 0, ]
+write.csv(upregulated_genes, file = "all_upregulated_genes.csv", row.names = TRUE)
+
+downregulated_genes <- res1_filtered[res1_filtered$log2FoldChange < 0, ]
+write.csv(downregulated_genes, file = "all_downregulated_genes.csv", row.names = TRUE)
+
+# to plot volcanoplot
+BiocManager::install("EnhancedVolcano")
+library(EnhancedVolcano)
+
+volcano_plot <- EnhancedVolcano(res1,
+                                lab = rep("", nrow(res1)),
+                                x = "log2FoldChange",
+                                y = "padj",
+                                pCutoff = 0.05,
+                                FCcutoff = 1,
+                                title = "Differential Expression in TCGA-LUAD")
+
+ggsave("volcano_plot2.png", plot = volcano_plot, width = 8, height = 6, dpi = 300)
+
+# MA plots
+plotMA(res, ylim = c(-5, 5))
+#HeatMap
+library(pheatmap)
+
+top_genes <- res1_filtered$gene_id[1:50]
+vsd <- vst(dds, blind = FALSE)
+mat <- assay(vsd)[top_genes, ]
+pheatmap(mat, scale = "row", show_rownames = FALSE)
+#Gene Ontology / Pathway Enrichment
+BiocManager::install("clusterProfiler")
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Convert Ensembl to Entrez IDs
+res1_filtered$ensembl_clean <- sub("\\..*", "", res1_filtered$gene_id)
+entrez_ids <- bitr(res1_filtered$ensembl_clean,
+                   fromType = "ENSEMBL", toType = "ENTREZID",
+                   OrgDb = org.Hs.eg.db)
+
+# Run enrichment
+go <- enrichGO(gene = entrez_ids$ENTREZID,
+               OrgDb = org.Hs.eg.db,
+               ont = "BP",
+               pAdjustMethod = "BH",
+               readable = TRUE)
+
+dotplot(go)
+# timer
+library(immunedeconv)
+#ensmbl id to gene id
+library(biomaRt)
+
+# Strip version from Ensembl IDs
+genes <- rownames(dds)
+genes_clean <- sub("\\..*", "", genes)
+
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = genes_clean,
+  mart = ensembl
+)
+
+# Create a clean mapping
+gene_map <- gene_map[!duplicated(gene_map$ensembl_gene_id), ]
+rownames(gene_map) <- gene_map$ensembl_gene_id
+gene_symbols <- gene_map[genes_clean, "hgnc_symbol"]
+
+# vst
+vsd <- vst(dds, blind = FALSE)
+expr_mat <- assay(vsd)
+
+# Add gene symbols as rownames
+rownames(expr_mat) <- gene_symbols
+
+# Remove genes without a symbol
+expr_mat <- expr_mat[!is.na(rownames(expr_mat)) & rownames(expr_mat) != "", ]
+#run timer
+result_timer <- deconvolute(expr_mat, method = "timer")
+#(found an error so)
+#Check orientation of your matrix
+dim(expr_mat)        # Should return (genes, samples)
+head(rownames(expr_mat))  # Should be gene symbols
+head(colnames(expr_mat))  # Should be TCGA sample barcodes
+#(format correct then)
+result_timer <- deconvolute(expr_mat, method = "timer", indications = rep("LUAD", ncol(expr_mat)))
+# ( found an error- Remove duplicated gene names from expr_mat
+expr_mat <- expr_mat[!duplicated(rownames(expr_mat)), ]
+#recheck
+sum(duplicated(rownames(expr_mat)))  # Should return 0
+# then re run the time
+result_timer <- deconvolute(expr_mat, method = "timer", indications = rep("LUAD", ncol(expr_mat)))
+saveRDS(result_timer, file = "immune_infiltration_TIMER.rds")
+# to get the saved file
+result_timer <- readRDS("immune_infiltration_TIMER.rds")
+write.csv(result_timer, file = "immune_infiltration_TIMER.csv", row.names = FALSE)
+#Visualize immune infiltration
+library(pheatmap)
+immune_matrix <- as.matrix(result_timer[, -1])  # remove cell type column
+rownames(immune_matrix) <- result_timer$cell_type
+
+pheatmap(immune_matrix, cluster_rows = TRUE, cluster_cols = TRUE, 
+         main = "Immune Cell Infiltration Heatmap")
+
+# Open PNG device first
+png("immune_infiltration_heatmap.png", width = 1000, height = 800)
+ # Now generate the plot inside the PNG
+  pheatmap(immune_matrix,
+             +          cluster_rows = TRUE,
+             +          cluster_cols = FALSE,
+             +          main = "Immune Cell Infiltration Heatmap",
+             +          show_colnames = FALSE)
+   # Close the device to write the image file
+   dev.off()
+
