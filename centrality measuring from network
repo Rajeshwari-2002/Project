@@ -1,0 +1,207 @@
+import pandas as pd
+import networkx as nx
+from networkx.algorithms import bipartite
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+from scipy.stats import ks_2samp
+
+# Load the graph
+G = nx.read_graphml("/home/hp/Desktop/RAJESWARI/new_correlation/igraph-micro-gene_normal_new_org.graphml")
+
+# Get node sets
+microbes = {n for n, d in G.nodes(data=True) if d['type'] == 'microbe'}
+genes = {n for n, d in G.nodes(data=True) if d.get('type', '').lower() in ['genes', 'Gene_Symbol']}  # in the case of immune<- immune = {n for n, d in G.nodes(data=True) if d.get('type', '').lower() in ['immune', 'immune_cell']}
+
+
+print(f"Number of microbe nodes: {len(microbes)}")
+print(f"Number of gene nodes: {len(genes)}")
+
+# Degree
+deg = dict(G.degree())
+deg_df = pd.DataFrame.from_dict(deg, orient='index', columns=['degree'])
+
+# Clustering coefficient for bipartite graph
+clust = bipartite.clustering(G, nodes=microbes.union(genes))
+clust_df = pd.DataFrame.from_dict(clust, orient='index', columns=['clustering'])
+
+def compute_redundancy(G, nodes):
+    redundancy_dict = {}
+    for node in nodes:
+        neighbors = set(G.neighbors(node))
+        if len(neighbors) < 2:
+            redundancy_dict[node] = 0.0
+            continue
+
+        actual_edges = 0
+        possible_edges = len(neighbors) * (len(neighbors) - 1) / 2
+
+        for nbr1 in neighbors:
+            for nbr2 in neighbors:
+                if nbr1 != nbr2 and G.has_edge(nbr1, nbr2):
+                    actual_edges += 1
+
+        actual_edges = actual_edges / 2
+        redundancy = actual_edges / possible_edges if possible_edges else 0
+        redundancy_dict[node] = redundancy
+
+    return redundancy_dict
+
+# Compute redundancy for BOTH node types
+microbe_redundancy = compute_redundancy(G, microbes)
+gene_redundancy = compute_redundancy(G, genes)
+
+# Combine redundancy dictionaries
+all_redundancy = {**microbe_redundancy, **gene_redundancy}
+redundancy_df = pd.DataFrame.from_dict(all_redundancy, orient='index', columns=['redundancy'])
+
+# Merge all metrics
+df = pd.concat([deg_df, clust_df, redundancy_df], axis=1)
+df['type'] = df.index.map(lambda x: G.nodes[x]['type'])
+df['name'] = df.index.map(lambda x: G.nodes[x].get('name', x))
+
+df.to_csv("/home/hp/Desktop/RAJESWARI/complete_correlation/microbe_gene_centrality_measures.csv")
+
+# Check for any missing values
+print("\nData summary:")
+print(df.groupby('type').agg({
+    'degree': ['count', 'min', 'max', 'mean'],
+    'clustering': ['min', 'max', 'mean'],
+    'redundancy': ['min', 'max', 'mean']
+}))
+
+# Kolmogorov-Smirnov tests
+for metric in ['degree', 'clustering', 'redundancy']:
+    microbe_vals = df[df['type'] == 'microbe'][metric].dropna()
+    gene_vals = df[df['type'] == 'gene'][metric].dropna()
+    if len(microbe_vals) > 0 and len(gene_vals) > 0:
+        ks_stat, p_val = ks_2samp(microbe_vals, gene_vals)
+        print(f"KS test for {metric}: statistic={ks_stat:.3f}, p-value={p_val:.3g}")
+    else:
+        print(f"KS test for {metric}: Not enough data for one or both groups.")
+
+
+# Degree Distribution Plot (Enhanced)
+plt.figure(figsize=(12, 8))
+
+for t, color in [('microbe', 'red'), ('Gene_Symbol', 'blue')]:
+    subset = df[df['type'] == t]
+    if len(subset) > 0:
+        values, counts = np.unique(subset['degree'], return_counts=True)
+        plt.scatter(values, counts, label=f'{t} (n={len(subset)})', 
+                   color=color, alpha=0.7, s=50)
+        print(f"\n{t} degree range: {values.min()} to {values.max()}")
+
+plt.xscale('log')
+plt.yscale('log')
+plt.xlabel('Degree')
+plt.ylabel('Frequency')
+plt.legend()
+plt.title("Degree Distribution")
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Alternative: Linear scale plot to see low-degree nodes
+plt.figure(figsize=(12, 6))
+
+for t, color in [('microbe', 'red'), ('Gene_Symbol', 'blue')]:
+    subset = df[df['type'] == t]
+    if len(subset) > 0:
+        values, counts = np.unique(subset['degree'], return_counts=True)
+        plt.scatter(values, counts, label=f'{t} (n={len(subset)})', 
+                   color=color, alpha=0.7, s=50)
+
+plt.xlabel('Degree')
+plt.ylabel('Frequency')
+plt.legend()
+plt.title("Degree Distribution (Linear Scale)")
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Redundancy Plot
+plt.figure(figsize=(10, 4))
+for t, color in [('microbe', 'red'), ('Gene_Symbol', 'blue')]:
+    subset = df[df['type'] == t]
+    if len(subset) > 0 and not subset['redundancy'].isna().all():
+        sns.kdeplot(data=subset, x='redundancy', label=f'{t}', color=color)
+
+plt.title("Density Plot of Redundancy")
+plt.xlabel("Redundancy")
+plt.ylabel("Density")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# Clustering Plot
+plt.figure(figsize=(10, 4))
+for t, color in [('microbe', 'red'), ('Gene_Symbol', 'blue')]:
+    subset = df[df['type'] == t]
+    if len(subset) > 0 and not subset['clustering'].isna().all():
+        sns.kdeplot(data=subset, x='clustering', label=f'{t}', color=color)
+
+plt.title("Density Plot of Clustering Coefficient")
+plt.xlabel("Clustering Coefficient")
+plt.ylabel("Density")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+#to identify hub genes and microbes
+# Assuming you have a DataFrame 'df' with columns: 'type', 'degree', 'clustering'
+
+# Identify top 5 hub microbes by degree
+hub_microbes = df[df['type'] == 'microbe'].sort_values('degree', ascending=False).head(20)
+print("Hub microbes:")
+print(hub_microbes[['degree', 'clustering']])
+hub_microbes.to_csv('top20_hub_microbes.csv', index=False)
+
+# Identify top 5 hub genes by degree
+hub_genes = df[df['type'] == 'gene'].sort_values('degree', ascending=False).head(20)
+print("Hub genes:")
+print(hub_genes[['degree', 'clustering']])
+hub_genes.to_csv('top20_hub_genes.csv', index=False)
+
+
+#visualization by subnetwork
+import networkx as nx
+import matplotlib.pyplot as plt
+
+hub_genes = df[df['type'] == 'gene'].sort_values('degree', ascending=False).head(20)
+hub_microbes = df[df['type'] == 'microbe'].sort_values('degree', ascending=False).head(20)
+
+# The index should be the node IDs
+hub_nodes = set(hub_genes.index).union(set(hub_microbes.index))
+
+sub_nodes = set()
+for hub in hub_nodes:
+    if hub in G:
+        sub_nodes.update(nx.ego_graph(G, hub, radius=1).nodes)
+    else:
+        print(f"Warning: {hub} not found in graph!")
+
+
+# Create the subgraph
+H = G.subgraph(sub_nodes)
+
+# Optional: Highlight hubs in visualization
+node_colors = []
+for node in H.nodes():
+    if node in hub_genes:
+        node_colors.append('blue')
+    elif node in hub_microbes:
+        node_colors.append('red')
+    else:
+        node_colors.append('gray')
+
+# Draw the subnetwork
+plt.figure(figsize=(10, 8))
+pos = nx.spring_layout(H, seed=42)
+nx.draw(H, pos, node_color=node_colors, with_labels=True, node_size=300)
+plt.title("Subnetwork of Hub Genes/Microbes and Their Immediate Neighbors")
+
+plt.savefig("subnetwork_hubs.png", format="png", dpi=300, bbox_inches='tight')
+
+plt.show()
