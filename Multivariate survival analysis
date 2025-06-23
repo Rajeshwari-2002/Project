@@ -1,0 +1,357 @@
+library(survival)
+library(survminer)
+library(glmnet)
+library(dplyr)
+library(readr)
+library(Matrix)
+library(survcomp)  # for concordance.index
+library(rms)       # for calibration
+library(caret)     # for cross-validation
+library(parallel)
+
+## to merge the data
+micro_df <- read.csv("/home/hp/Desktop/RAJESWARI/survival/complete_microbiome_clr transformed_table.csv", stringsAsFactors = FALSE)
+gene_df <- read.csv("expression_filtered.csv", stringsAsFactors = FALSE)
+immune_df <- read.csv("/home/hp/Desktop/RAJESWARI/diversity_immune_plots/immune_infiltration_score_matrix_transposed.csv", stringsAsFactors = FALSE)
+clinical_df <- read.csv("edited_by deletion_metadata.csv", stringsAsFactors = FALSE)
+
+# Remove duplicates and set rownames
+micro_df <- micro_df[!duplicated(micro_df$tcga_barcode), ]
+gene_df <- gene_df[!duplicated(gene_df$tcga_barcode), ]
+immune_df <- immune_df[!duplicated(immune_df$tcga_barcode), ]
+clinical_df <- clinical_df[!duplicated(clinical_df$tcga_barcode), ]
+
+rownames(micro_df) <- micro_df$tcga_barcode
+rownames(gene_df) <- gene_df$tcga_barcode
+rownames(immune_df) <- immune_df$tcga_barcode
+rownames(clinical_df) <- clinical_df$tcga_barcode
+
+micro_df$tcga_barcode <- NULL
+gene_df$tcga_barcode <- NULL
+immune_df$tcga_barcode <- NULL
+clinical_df$tcga_barcode <- NULL
+
+# Rename survival column if present
+if("Overall.Survival..Months." %in% colnames(clinical_df)){
+  colnames(clinical_df)[colnames(clinical_df) == "Overall.Survival..Months."] <- "OS"
+} else {
+  stop("Column Overall.Survival..Months. not found in clinical data")
+}
+
+# --- 2. Merge Data ---
+common_ids <- Reduce(intersect, list(rownames(micro_df), rownames(gene_df), rownames(immune_df), rownames(clinical_df)))
+
+micro_df <- micro_df[common_ids, , drop=FALSE]
+gene_df <- gene_df[common_ids, , drop=FALSE]
+immune_df <- immune_df[common_ids, , drop=FALSE]
+clinical_df <- clinical_df[common_ids, , drop=FALSE]
+
+merged_df <- cbind(
+  clinical_df[, c("OS", "event_status", "age", "Stage"), drop=FALSE],
+  micro_df,
+  gene_df,
+  immune_df
+)
+
+merged_df$Stage <- as.factor(as.character(merged_df$Stage))
+
+merged_df <- read.csv("merged_df_with immune.csv")
+
+
+# --- 1. Load and Prepare Data ---
+merged_df <- read.csv("merged_df_with immune.csv")  # merge the gene expression data, clinical data, micrtobiome data, and immune infiltration data
+
+
+# --- 2. Filter and Clean Features ---
+feature_df <- merged_df[, !(colnames(merged_df) %in% c("OS", "event_status", "age", "Stage"))]
+feature_df <- feature_df[, apply(feature_df, 2, function(x) length(unique(na.omit(x))) > 1)]
+feature_df <- feature_df[, colMeans(is.na(feature_df)) < 0.2]
+
+# Remove near-zero variance features
+cat("Number of features before NZV removal:", ncol(feature_df), "\n")
+nzv <- nearZeroVar(feature_df)
+if(length(nzv) > 0) feature_df <- feature_df[, -nzv, drop=FALSE]
+cat("Number of features after NZV removal:", ncol(feature_df), "\n")
+
+# Remove non-numeric and unwanted columns
+non_numeric_cols <- sapply(feature_df, function(x) !is.numeric(x))
+print(names(feature_df)[non_numeric_cols])
+feature_df <- feature_df[, !(names(feature_df) %in% c("X", "tcga_barcode"))]
+
+# Remove highly correlated features
+cor_mat <- cor(feature_df, use="pairwise.complete.obs")
+high_corr <- findCorrelation(cor_mat, cutoff=0.9)
+if(length(high_corr) > 0) feature_df <- feature_df[, -high_corr, drop=FALSE]
+
+# Impute missing values with median
+impute_median <- function(x) replace(x, is.na(x), median(x, na.rm=TRUE))
+feature_df <- as.data.frame(lapply(feature_df, impute_median))
+
+# Standardize features
+feature_df <- as.data.frame(scale(feature_df))
+
+# --- 3. Univariate Cox Pre-Selection ---
+uni_p <- apply(feature_df, 2, function(x) {
+  summary(coxph(Surv(merged_df$OS, merged_df$event_status) ~ x))$coef[5]  # p-value
+})
+selected_univariate <- names(uni_p[uni_p < 0.1])
+feature_df <- feature_df[, selected_univariate]
+
+# --- 4. Prepare Final Modeling Data ---
+merged_df$age <- scale(merged_df$age)
+model_df <- cbind(
+  merged_df[, c("OS", "event_status", "Stage")],
+  age = merged_df$age,
+  feature_df
+)
+
+# One-hot encode Stage (drop first level)
+dummies <- model.matrix(~ Stage, data = model_df)[, -1, drop=FALSE]
+model_df <- cbind(model_df[, !colnames(model_df) %in% "Stage"], dummies)
+
+# --- 5. Train/Test Split ---
+set.seed(42)
+train_idx <- createDataPartition(model_df$event_status, p=0.7, list=FALSE)
+train_df <- model_df[train_idx, ]
+test_df <- model_df[-train_idx, ]
+train_df <- train_df[train_df$OS > 0, ]
+
+# --- 6. Prepare Matrices ---
+x_train <- as.matrix(train_df[, !(colnames(train_df) %in% c("OS", "event_status"))])
+y_train <- Surv(train_df$OS, train_df$event_status)
+x_test <- as.matrix(test_df[, !(colnames(test_df) %in% c("OS", "event_status"))])
+y_test <- Surv(test_df$OS, test_df$event_status)
+
+# --- 7. Elastic Net Cox with CV ---
+set.seed(42)
+cvfit_enet <- cv.glmnet(
+  x_train, y_train,
+  family = "cox",
+  alpha = 0.5,
+  nfolds = 10,
+  standardize = FALSE
+)
+best_lambda <- cvfit_enet$lambda.min
+enet_fit <- glmnet(x_train, y_train, family = "cox", alpha = 0.5, lambda = best_lambda)
+
+coef_enet <- coef(enet_fit)
+selected_features_enet <- rownames(coef_enet)[as.numeric(coef_enet) != 0]
+cat("Number of features selected by Elastic Net:", length(selected_features_enet), "\n")
+
+# --- 8. Fit Final Cox Model ---
+colnames(train_df) <- make.names(colnames(train_df), unique = TRUE)
+selected_features_enet <- make.names(selected_features_enet, unique = TRUE)
+cox_formula <- as.formula(paste("Surv(OS, event_status) ~", paste(selected_features_enet, collapse = "+")))
+cox_fit <- coxph(cox_formula, data = train_df)
+
+# --- 9. Check PH Assumption ---
+ph_test <- cox.zph(cox_fit)
+print(ph_test)
+plot(ph_test)
+
+# --- 10. Model Evaluation ---
+# Create survival object
+surv_obj <- Surv(time = train_df$OS, event = train_df$event_status)
+x_train <- as.matrix(train_df[, !(colnames(train_df) %in% c("OS", "event_status"))])
+x_test  <- as.matrix(test_df[, !(colnames(test_df) %in% c("OS", "event_status"))])
+
+# Fit Cox model using glmnet (LASSO / ElasticNet)
+library(glmnet)
+
+set.seed(123)
+cox_fit <- cv.glmnet(
+  x = x_train,
+  y = surv_obj,
+  family = "cox",
+  alpha = 1,             # LASSO
+  nfolds = 10
+)
+plot(cox_fit)
+
+best_lambda <- cox_fit$lambda.min
+lasso_coefs <- coef(cox_fit, s = best_lambda)
+active_coefs <- lasso_coefs[lasso_coefs != 0]
+print(active_coefs)
+
+# Get feature names
+feature_names <- rownames(lasso_coefs)
+ # Extract names of selected (non-zero) features
+selected_features <- feature_names[lasso_coefs[, 1] != 0]
+print(selected_features)
+
+train_risk <- predict(cox_fit, newx = x_train, s = best_lambda, type = "link")
+test_risk  <- predict(cox_fit, newx = x_test, s = best_lambda, type = "link")
+
+library(survcomp)
+
+c_index_train <- concordance.index(x = train_risk, surv.time = train_df$OS, surv.event = train_df$event_status)$c.index
+c_index_test  <- concordance.index(x = test_risk,  surv.time = test_df$OS,  surv.event = test_df$event_status)$c.index
+
+cat("Train C-index:", c_index_train, "\n")
+cat("Test C-index:", c_index_test, "\n")
+
+#if needed a plot
+cindex_df <- data.frame(
+  Dataset = c("Train", "Test"),
+  C_Index = c(c_index_train, c_index_test)
+)
+
+library(ggplot2)
+ggplot(cindex_df, aes(x = Dataset, y = C_Index, fill = Dataset)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(aes(label = round(C_Index, 3)), vjust = -0.5, size = 5) +
+  ylim(0, 1) +
+  labs(title = "Concordance Index (C-index)", y = "C-index") +
+  theme_minimal()
+
+#Stratify into Risk Groups for KM Plot
+library(survminer)
+
+# Median split
+test_df$risk_group <- ifelse(test_risk > median(test_risk), "High", "Low")
+surv_test <- Surv(test_df$OS, test_df$event_status)
+fit_km <- survfit(surv_test ~ risk_group, data = test_df)
+
+# Plot KM
+ggsurvplot(fit_km, data = test_df, pval = TRUE, risk.table = TRUE)
+
+#Time-dependent ROC Curve for Train & Test
+library(timeROC)
+
+# --- Train ROC ---
+# Use months: 12 months = 1 year, 24 = 2 years, 36 = 3 years
+library(timeROC)
+
+# --- Train ROC ---
+roc_train <- timeROC(
+  T = train_df$OS,
+  delta = train_df$event_status,
+  marker = train_risk,
+  cause = 1,
+  times = c(12, 24, 36),
+  iid = TRUE
+)
+
+# --- Test ROC ---
+roc_test <- timeROC(
+  T = test_df$OS,
+  delta = test_df$event_status,
+  marker = test_risk,
+  cause = 1,
+  times = c(12, 24, 36),
+  iid = TRUE
+)
+
+# --- Plot ---
+plot(roc_train, time = 12, col = "blue", title = "12-Month Time-dependent ROC")
+plot(roc_test, time = 12, add = TRUE, col = "red")
+
+# --- Add legend ---
+legend("bottomright", legend = c("Train", "Test"), col = c("blue", "red"), lty = 1)
+
+# --- Display AUC on plot ---
+text(0.6, 0.2, paste0("Train AUC = ", round(roc_train$AUC[1], 3)), col = "blue", cex = 0.9)
+text(0.6, 0.15, paste0("Test AUC = ", round(roc_test$AUC[1], 3)), col = "red", cex = 0.9)
+
+#Forest Plot (for selected features from LASSO)
+library(forestplot)
+
+# Create a data frame with coef and CI
+coefs <- as.numeric(active_coefs)
+hr <- exp(coefs)
+ci <- exp(confint(coxph(Surv(OS, event_status) ~ ., data = test_df[, names(active_coefs)])))
+
+table_data <- data.frame(
+  Variables = names(active_coefs),
+  HR = round(hr, 2),
+  Lower = round(ci[, 1], 2),
+  Upper = round(ci[, 2], 2)
+)
+
+forestplot(labeltext = table_data$Variables,
+           mean = table_data$HR,
+           lower = table_data$Lower,
+           upper = table_data$Upper,
+           xlog = TRUE)
+
+# Calibration Plot
+library(rms)
+
+dd <- datadist(test_df)
+options(datadist = "dd")
+fit_cal <- cph(Surv(OS, event_status) ~ test_risk, data = test_df, x = TRUE, y = TRUE, surv = TRUE)
+
+cal <- calibrate(fit_cal, method = "boot", B = 100)
+plot(cal)
+
+#. Survival Heatmap
+library(pheatmap)
+
+sorted_idx <- order(test_risk, decreasing = TRUE)
+heatmap_data <- as.matrix(test_df[sorted_idx, names(active_coefs)])
+pheatmap(heatmap_data, cluster_rows = FALSE, cluster_cols = TRUE,
+         annotation_row = data.frame(Risk = ifelse(test_risk[sorted_idx] > median(test_risk), "High", "Low")))
+
+#Stage-wise Kaplan-Meier Curves
+library(survminer)
+
+test_df$stage <- as.factor(test_df$stage)
+fit_stage <- survfit(Surv(OS, event_status) ~ stage, data = test_df)
+ggsurvplot(fit_stage, data = test_df, pval = TRUE, risk.table = TRUE)
+
+
+###to plot feature selected biomarkers
+
+# Ensure it's a named vector with rownames intact
+nonzero_idx <- which(as.numeric(lasso_coefs) != 0)
+nonzero_names <- rownames(lasso_coefs)[nonzero_idx]
+nonzero_coefs <- as.numeric(lasso_coefs)[nonzero_idx]
+
+# Create data frame
+coef_df <- data.frame(
+  Feature = nonzero_names,
+  Coefficient = nonzero_coefs
+)
+
+# Calculate Hazard Ratio and Confidence Intervals
+coef_df$HR <- exp(coef_df$Coefficient)
+
+# Clean feature names if needed
+selected_features <- make.names(coef_df$Feature, unique = TRUE)
+
+# Create formula
+cox_formula <- as.formula(paste("Surv(OS, event_status) ~", paste(selected_features, collapse = "+")))
+
+# Fit final Cox model
+final_cox <- coxph(cox_formula, data = train_df)
+
+# Get summary
+summary_fit <- summary(final_cox)
+
+# Extract coefficients
+hr <- exp(summary_fit$coef[, "coef"])
+lower <- exp(summary_fit$conf.int[, "lower .95"])
+upper <- exp(summary_fit$conf.int[, "upper .95"])
+pval  <- summary_fit$coef[, "Pr(>|z|)"]
+
+# Combine into a table
+forest_df <- data.frame(
+  Feature = rownames(summary_fit$coef),
+  HR = hr,
+  CI_lower = lower,
+  CI_upper = upper,
+  p_value = pval
+)
+
+library(ggplot2)
+
+ggplot(forest_df, aes(x = reorder(Feature, HR), y = HR)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Forest Plot of Selected Biomarkers",
+       x = "Biomarker",
+       y = "Hazard Ratio (HR)") +
+  scale_y_log10()
