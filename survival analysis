@@ -1,0 +1,415 @@
+# Load libraries
+library(survival)
+library(survminer)
+library(glmnet)
+library(dplyr)
+library(readr)
+library(Matrix)
+library(survcomp)  # for concordance.index
+library(rms)       # for calibration
+library(caret)     # for cross-validation
+library(parallel)
+
+# Load data
+micro_df <- read.csv("/home/hp/Desktop/RAJESWARI/survival/complete_microbiome_clr transformed_table.csv")
+gene_df  <- read.csv("expression_filtered.csv")
+clin_df  <- read.csv("edited_by deletion_metadata.csv")
+
+#to convert gene name to ensembl id 
+library(biomaRt)
+ensg_ids <- gsub("\\..*$", "", colnames(gene_df)[-1])
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene_map <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"),
+                  filters = "ensembl_gene_id",
+                  values = ensg_ids,
+                  mart = ensembl)
+
+# Match gene symbols
+symbol_map <- gene_map$hgnc_symbol
+names(symbol_map) <- gene_map$ensembl_gene_id
+new_colnames <- c("tcga_barcode", symbol_map[ensg_ids])
+new_colnames[is.na(new_colnames)] <- colnames(gene_df)[-1][is.na(new_colnames)]
+
+# Ensure uniqueness
+new_colnames <- make.unique(new_colnames)
+
+colnames(gene_df) <- new_colnames
+
+# Remove duplicates
+micro_df <- micro_df[!duplicated(micro_df$tcga_barcode), ]
+gene_df  <- gene_df[!duplicated(gene_df$tcga_barcode), ]
+clin_df  <- clin_df[!duplicated(clin_df$tcga_barcode), ]
+
+# Merge all
+merged_df <- micro_df %>%
+  inner_join(gene_df, by = "tcga_barcode") %>%
+  inner_join(clin_df, by = "tcga_barcode")
+
+# Filter for known stages
+merged_df <- merged_df[merged_df$Stage %in% c("Stage I", "Stage II", "Stage III", "Stage IV"), ]
+
+# Rename survival column
+colnames(merged_df)[colnames(merged_df) == "Overall.Survival..Months."] <- "OS"
+
+# Convert types
+merged_df$OS           <- as.numeric(merged_df$OS)
+merged_df$event_status <- as.numeric(merged_df$event_status)
+merged_df$age          <- as.numeric(merged_df$age)
+merged_df$Stage        <- as.factor(merged_df$Stage)
+
+# Define the survival object
+surv_obj <- Surv(time = merged_df$OS, event = merged_df$event_status)
+
+# Set the column ranges (update these if your real index ranges differ)
+microbe_cols <- 2:1023    # Adjust these column indices if needed
+gene_cols    <- 1024:2045 # Non-overlapping range
+
+# Get column names
+microbes <- colnames(merged_df)[microbe_cols]
+genes    <- colnames(merged_df)[gene_cols]
+
+# Filter out constant or NA-only columns
+valid_microbes <- microbes[sapply(merged_df[microbes], function(x) length(unique(x[!is.na(x)])) > 1)]
+valid_genes    <- genes[sapply(merged_df[genes],    function(x) length(unique(x[!is.na(x)])) > 1)]
+
+# Create all microbe-gene pairs
+pairs <- expand.grid(Microbe = valid_microbes, Gene = valid_genes, stringsAsFactors = FALSE)
+
+# Pre-convert numeric columns to speed up processing
+merged_df[valid_microbes] <- lapply(merged_df[valid_microbes], as.numeric)
+merged_df[valid_genes]    <- lapply(merged_df[valid_genes], as.numeric)
+
+# Cox model function
+run_cox <- function(idx) {
+  m <- pairs$Microbe[idx]
+  g <- pairs$Gene[idx]
+  tryCatch({
+    formula <- as.formula(paste("surv_obj ~", m, "+", g, "+ age + Stage"))
+    fit <- coxph(formula, data = merged_df)
+    summ <- summary(fit)
+    data.frame(
+      Microbe = m,
+      Gene = g,
+      HR_micro = summ$coefficients[m, "exp(coef)"],
+      p_micro  = summ$coefficients[m, "Pr(>|z|)"],
+      HR_gene  = summ$coefficients[g, "exp(coef)"],
+      p_gene   = summ$coefficients[g, "Pr(>|z|)"],
+      HR_age   = summ$coefficients["age", "exp(coef)"],
+      p_age    = summ$coefficients["age", "Pr(>|z|)"],
+      HR_stageII = ifelse("StageII" %in% rownames(summ$coefficients), summ$coefficients["StageII", "exp(coef)"], NA),
+      p_stageII  = ifelse("StageII" %in% rownames(summ$coefficients), summ$coefficients["StageII", "Pr(>|z|)"], NA),
+      HR_stageIII= ifelse("StageIII" %in% rownames(summ$coefficients), summ$coefficients["StageIII", "exp(coef)"], NA),
+      p_stageIII = ifelse("StageIII" %in% rownames(summ$coefficients), summ$coefficients["StageIII", "Pr(>|z|)"], NA),
+      HR_stageIV = ifelse("StageIV" %in% rownames(summ$coefficients), summ$coefficients["StageIV", "exp(coef)"], NA),
+      p_stageIV  = ifelse("StageIV" %in% rownames(summ$coefficients), summ$coefficients["StageIV", "Pr(>|z|)"], NA)
+    )
+  }, error = function(e) {
+    # Optional: print for debug
+    # cat("Error at:", m, g, "-", e$message, "\n")
+    NULL
+  })
+}
+
+# Run in parallel
+n_cores <- detectCores() - 1
+results_list <- mclapply(1:nrow(pairs), run_cox, mc.cores = n_cores)
+
+# Combine into one data frame
+results <- do.call(rbind, results_list)
+
+# Save result if needed
+write.csv(results, "cox_microbe_gene_results_1.csv", row.names = FALSE)
+sig_results <- results %>% filter(p_micro < 0.05 | p_gene < 0.05)
+write_csv(sig_results, "significant_pairs_1.csv")
+
+results = read.csv("/home/hp/Desktop/RAJESWARI/survival/cox_microbe_gene_results_python.csv")
+sig_results = read.csv("/home/hp/Desktop/RAJESWARI/survival/significant_pairs_python.csv")  
+
+
+# Required libraries
+library(survival)
+library(glmnet)
+library(dplyr)
+library(ggplot2)
+
+# STEP 1: Train/Test split
+set.seed(123)
+n <- nrow(merged_df)
+train_idx <- sample(seq_len(n), size = 0.7 * n)
+train_df  <- merged_df[train_idx, ]
+test_df   <- merged_df[-train_idx, ]
+
+# STEP 2: LASSO Cox Model Preparation
+# Define predictors
+predictors <- c(microbes, genes, "age")
+
+# Filter complete rows in training data
+train_df_complete <- train_df[complete.cases(train_df[, predictors]), ]
+
+# Design matrix (no intercept)
+X_train <- model.matrix(~ . -1, data = train_df_complete[, predictors])
+
+# Survival object
+y_train <- Surv(train_df_complete$OS, train_df_complete$event_status)
+
+# Filter valid survival times
+valid_idx <- y_train[, "time"] > 0
+X_train <- X_train[valid_idx, ]
+y_train <- y_train[valid_idx, ]
+
+# STEP 3: Fit LASSO Cox model
+cvfit <- cv.glmnet(X_train, y_train, family = "cox", alpha = 1)
+best_lambda <- cvfit$lambda.min
+
+# Extract selected features
+coef_lasso <- coef(cvfit, s = best_lambda)
+selected_features <- rownames(coef_lasso)[coef_lasso[, 1] != 0]
+selected_features <- selected_features[selected_features != "(Intercept)"]
+
+# STEP 4: Refit Cox model with selected features
+# Convert Surv object to data frame
+y_df <- as.data.frame(as.matrix(y_train))
+colnames(y_df) <- c("OS", "event_status")
+
+# Full training data
+train_data <- cbind(y_df, as.data.frame(X_train))
+
+# Fit Cox model
+cox_formula <- as.formula(paste("Surv(OS, event_status) ~", paste(selected_features, collapse = " + ")))
+cox_refit <- coxph(cox_formula, data = train_data)
+cox_summary <- summary(cox_refit)
+
+# STEP 5: Prepare result dataframe for plotting
+result_df <- data.frame(
+  Variable  = rownames(cox_summary$coefficients),
+  HR        = exp(cox_summary$coefficients[, "coef"]),
+  lower_CI  = cox_summary$conf.int[, "lower .95"],
+  upper_CI  = cox_summary$conf.int[, "upper .95"],
+  p_value   = cox_summary$coefficients[, "Pr(>|z|)"]
+)
+
+# Add significance annotation
+result_df$Significance <- ifelse(result_df$p_value < 0.05, "Significant", "Not Significant")
+
+# Optional: Clean variable names (genes/microbes)
+result_df$Variable <- gsub(".*\\.g__", "", result_df$Variable)  # remove leading taxonomy
+result_df$Variable <- gsub("_", " ", result_df$Variable)
+
+# Sort and set factor levels
+result_df <- result_df %>% arrange(Significance, desc(HR))
+result_df$Variable <- factor(result_df$Variable, levels = result_df$Variable)
+
+# STEP 6: Forest Plot
+p <- ggplot(result_df, aes(x = HR, y = Variable, color = Significance)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = lower_CI, xmax = upper_CI), height = 0.2, linewidth = 1) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "red") +
+  geom_text(aes(label = round(HR, 2)), hjust = 0, nudge_x = 0.1, size = 3) +
+  scale_color_manual(values = c("Significant" = "red", "Not Significant" = "blue")) +
+  labs(
+    title = "Forest Plot of Cox Model (LASSO-selected Features)",
+    x = "Hazard Ratio (95% CI)",
+    y = "Variables"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "right",
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(size = 10)
+  )
+
+# Save the plot
+ggsave("cox_forest_plot_1.png", plot = p, width = 10, height = 6, dpi = 300)
+
+# Show the plot
+print(p)
+
+# STEP 9: Evaluation
+# Load required packages
+library(glmnet)
+library(survival)
+library(survcomp)   # For concordance.index
+library(rms)        # For cph and calibrate
+
+# STEP 1: Prepare test data for prediction -------------------------------------
+
+# Ensure selected features from training are present in test data
+all_cols <- colnames(X_train)  # X_train is the model.matrix used in training
+
+# Fill missing columns in test_df with zeros
+for (col in setdiff(all_cols, colnames(test_df))) {
+  test_df[[col]] <- 0
+}
+
+# Keep only relevant columns and order them as in training
+test_df_fixed <- test_df[, all_cols, drop = FALSE]
+test_df_fixed <- test_df_fixed[, all_cols]
+
+# Create matrix for prediction
+X_test <- as.matrix(test_df_fixed)
+
+# STEP 2: Predict risk scores using LASSO model --------------------------------
+
+risk_scores <- predict(cvfit, newx = X_test, s = best_lambda, type = "link")
+
+# STEP 3: Evaluate model with C-index ------------------------------------------
+
+# Ensure outcome variables exist
+outcomes <- c("OS", "event_status")
+
+# Compute Concordance Index
+cindex <- concordance.index(
+  x = risk_scores,
+  surv.time = test_df$OS,
+  surv.event = test_df$event_status
+)
+print(paste("C-index:", round(cindex$c.index, 3)))
+
+# STEP 4: Calibration using rms::cph ------------------------------------------
+
+# Filter constant predictors
+predictors <- setdiff(colnames(test_df), outcomes)
+nzv <- apply(test_df[, predictors], 2, function(x) length(unique(x)) > 1)
+
+# Create filtered dataset for calibration
+test_df_filtered <- cbind(test_df[, outcomes], test_df[, predictors[nzv]])
+
+# Assign time unit to OS
+attr(test_df_filtered$OS, "units") <- "month"
+
+# Define the formula using selected features
+selected_formula <- as.formula(paste("Surv(OS, event_status) ~", paste(selected_features, collapse = "+")))
+
+# Set datadist for rms
+dd <- datadist(test_df_filtered)
+options(datadist = "dd")
+
+# Fit Cox model using cph
+fit <- cph(
+  formula = selected_formula,
+  data = test_df_filtered,
+  x = TRUE,
+  y = TRUE,
+  surv = TRUE
+)
+
+# Calibration at a specific time (e.g., 18 months)
+cal <- calibrate(
+  fit,
+  cmethod = "KM",
+  method = "boot",
+  u = 18,        # Time in months
+  m = 50,
+  B = 1000
+)
+
+# STEP 5: Plot Calibration Curve -----------------------------------------------
+
+plot(cal,
+     xlab = "Predicted Survival Probability",
+     ylab = "Observed Survival Probability",
+     lwd = 2, lty = 1, col = "blue",
+     subtitles = FALSE)
+abline(0, 1, col = "gray", lty = 2)
+
+# STEP 10: Risk Stratification
+
+# 1. Add missing features (if any) with 0
+missing_features <- setdiff(selected_features, colnames(merged_df))
+if (length(missing_features) > 0) {
+  merged_df[missing_features] <- 0
+}
+# 2. Predict linear predictor (risk score)
+quantiles <- quantile(merged_df$risk_score, probs = c(0.25, 0.75))
+merged_df$risk_group <- cut(merged_df$risk_score,
+                            breaks = c(-Inf, quantiles[1], quantiles[2], Inf),
+                            labels = c("Low", "Medium", "High"))
+
+merged_df$risk_score <- predict(fit, newdata = merged_df, type = "lp")
+# 3. Stratify into High vs Low based on median
+median_risk <- median(merged_df$risk_score, na.rm = TRUE)
+merged_df$risk_group <- ifelse(merged_df$risk_score >= median_risk, "High", "Low")
+# 4. Ensure factor levels are ordered correctly
+merged_df$risk_group <- factor(merged_df$risk_group, levels = c("Low", "High"))
+cox_lasso_fit <- coxph(Surv(OS, event_status) ~ risk_score + age + stage, data = merged_df)
+
+# 5. Fit Kaplan-Meier curve
+library(survminer)
+surv_obj <- Surv(merged_df$OS, merged_df$event_status)
+fit_km <- survfit(surv_obj ~ risk_group, data = merged_df)
+# 6. Plot Kaplan-Meier curve
+ggsurvplot(fit_km,
+           data = merged_df,
+           pval = TRUE,
+           risk.table = TRUE,
+           palette = c("steelblue", "firebrick"),
+           xlab = "Time (Months)",
+           ylab = "Survival Probability",
+           title = "Kaplan-Meier Curve by Risk Group")
+
+
+# STEP 11: Time-dependent ROC
+roc_obj <- timeROC(T = merged_df$OS, delta = merged_df$event_status,
+                   marker = merged_df$risk_score, cause = 1,
+                   times = c(365, 1095, 1825), iid = TRUE)
+plot(roc_obj, time = 365, col = "blue", title = "1-Year Time-dependent ROC")
+plot(roc_obj, time = 1095, col = "green", title = "3-Year Time-dependent ROC")
+plot(roc_obj, time = 1825, col = "red", title = "5-Year Time-dependent ROC")
+
+# STEP 12: Cross-validation
+folds <- createFolds(merged_df$event_status, k = 5)
+cindex_vals <- numeric(5)
+
+for(i in 1:5){
+  train_idx <- setdiff(seq_len(nrow(merged_df)), folds[[i]])
+  train_cv <- merged_df[train_idx, ]
+  test_cv  <- merged_df[folds[[i]], ]
+  X_train_cv <- model.matrix(~ . -1, data = train_cv[, predictors])
+  y_train_cv <- Surv(train_cv$OS, train_cv$event_status)
+  cvfit_cv <- cv.glmnet(X_train_cv, y_train_cv, family = "cox", alpha = 1)
+  best_lambda_cv <- cvfit_cv$lambda.min
+  coef_lasso_cv <- coef(cvfit_cv, s = best_lambda_cv)
+  selected_features_cv <- rownames(coef_lasso_cv)[which(coef_lasso_cv != 0)]
+  selected_features_cv <- selected_features_cv[selected_features_cv %in% colnames(train_cv)]
+  if(length(selected_features_cv) > 0){
+    cox_formula_cv <- as.formula(paste("Surv(OS, event_status) ~", paste(selected_features_cv, collapse = " + ")))
+    cox_fit_cv <- coxph(cox_formula_cv, data = train_cv)
+    risk_scores_cv <- predict(cox_fit_cv, newdata = test_cv, type = "risk")
+    cindex_cv <- concordance.index(x = risk_scores_cv, surv.time = test_cv$OS, surv.event = test_cv$event_status)
+    cindex_vals[i] <- cindex_cv$c.index
+  } else {
+    cindex_vals[i] <- NA
+  }
+}
+mean_cindex <- mean(cindex_vals, na.rm = TRUE)
+print(mean_cindex)
+boxplot(cindex_vals, main = "C-index across 5 folds", ylab = "C-index")
+
+# STEP 13: Cox Assumptions
+print(cox.zph(cox_lasso_fit))
+plot(cox.zph(cox_lasso_fit))
+
+# STEP 14: KM Plot for Top Pairs
+top_pairs <- sig_results %>% arrange(p_micro, p_gene) %>% head(3)
+for(i in 1:nrow(top_pairs)){
+  microbe <- top_pairs$Microbe[i]
+  gene <- top_pairs$Gene[i]
+  merged_df$microbe_group <- ifelse(merged_df[[microbe]] >= median(merged_df[[microbe]], na.rm=TRUE), "High", "Low")
+  merged_df$gene_group <- ifelse(merged_df[[gene]] >= median(merged_df[[gene]], na.rm=TRUE), "High", "Low")
+  merged_df$combo_group <- paste0(merged_df$microbe_group, "_", merged_df$gene_group)
+  surv_obj <- Surv(merged_df$OS, merged_df$event_status)
+  fit <- survfit(surv_obj ~ combo_group, data=merged_df)
+  print(ggsurvplot(fit, data=merged_df, pval=TRUE, risk.table=TRUE,
+                   title = paste0("KM Plot: ", microbe, " + ", gene),
+                   legend.title = "Groups",
+                   palette = c("#E7B800", "#2E9FDF", "#FC4E07", "#00BA38")))
+}
+
+# STEP 15: Stratified KM by Stage
+merged_df$stage <- as.factor(merged_df$stage)
+surv_obj <- Surv(merged_df$OS, merged_df$event_status)
+fit_stage <- survfit(surv_obj ~ stage, data = merged_df)
+ggsurvplot(fit_stage, data = merged_df, pval = TRUE, risk.table = TRUE,
+           conf.int = TRUE, palette = "Dark2", legend.title = "Cancer Stage",
+           title = "Kaplan-Meier Survival Curves by Stage",
+           xlab = "Time (days)", ylab = "Survival Probability")
