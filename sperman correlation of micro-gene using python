@@ -1,0 +1,102 @@
+#Step 1: Import Required Libraries
+
+import pandas as pd
+from scipy.stats import spearmanr
+from joblib import Parallel, delayed
+from statsmodels.stats.multitest import multipletests
+
+#step 2 : Load and align the data:
+
+# Load genus abundance table (rows: genera, columns: samples)
+
+otu_by_genus = pd.read_csv('/home/hp/Desktop/RAJESWARI/new_correlation/microbiome centered Log-Ratio Transformation-stage2.csv', index_col=0)
+otu_by_genus = otu_by_genus.T 
+
+# Load gene expression table (rows: samples, columns: genes)
+
+exp = pd.read_csv('/home/hp/Desktop/RAJESWARI/new_correlation/stage2_expression_transposed_new.csv', index_col=0)
+exp = exp.T
+
+# Ensure samples are aligned and in the same order
+
+common_samples = otu_by_genus.columns.intersection(exp.index)
+print(len(common_samples))
+
+otu_by_genus = otu_by_genus[common_samples]
+exp = exp.loc[common_samples]
+
+
+
+#Step 3: Define the Correlation Calculation Function
+
+def calculate_correlations(otu_by_genus, exp):
+    """
+    Calculates Spearman correlations and p-values between each genus
+    in otu_by_genus and each gene in exp.
+    """
+    genera = otu_by_genus.index
+    genes = exp.index  # After transposing, genes are now index (rows)
+
+    def compute_correlation(genus, gene):
+        genus_values = otu_by_genus.loc[genus]
+        gene_values = exp.loc[gene]
+
+        # Skip if either vector is constant
+        if genus_values.nunique() <= 1 or gene_values.nunique() <= 1:
+            return {"Taxa": genus, "Gene": gene, "Correlation": None, "Pvalue": None}
+
+        corr, pval = spearmanr(genus_values, gene_values)
+        return {"Taxa": genus, "Gene": gene, "Correlation": corr, "Pvalue": pval}
+
+    # Parallel computation for all genus-gene pairs
+    results = Parallel(n_jobs=-1)(
+        delayed(compute_correlation)(genus, gene)
+        for genus in genera
+        for gene in genes
+    )
+    return pd.DataFrame(results)
+
+
+#Step 4: Run the Correlation Analysis
+
+results_df = calculate_correlations(otu_by_genus, exp)
+print(results_df.head())
+results_df.to_csv("/home/hp/Desktop/RAJESWARI/new_correlation/stage2_micro-gene_correlation.csv", index=False)
+
+#Step 5: Adjust p-values for Multiple Testing
+
+# Drop rows with None p-values for correction
+pvals = results_df['Pvalue'].dropna()
+reject, pvals_corrected, _, _ = multipletests(pvals, method='fdr_bh')
+
+# Assign corrected p-values back to the DataFrame
+results_df.loc[results_df['Pvalue'].notna(), 'Pvalue_Corrected'] = pvals_corrected
+
+print(results_df.head())
+
+#Step 6: Save the Results
+
+results_df.to_csv("/home/hp/Desktop/RAJESWARI/new_correlation/stage2_micro-gene_correlation_1.csv", index=False)
+
+# Filter for significant correlations (e.g., FDR < 0.05)
+
+
+sig_results = results_df[(results_df['Pvalue_Corrected'] < 0.05) & results_df['Correlation'].notna()].copy()
+print(f"Significant correlations: {sig_results.shape[0]}")
+results_df.to_csv("/home/hp/Desktop/RAJESWARI/new_correlation/stage2_micro-gene_sig_correlation.csv", index=False)
+
+# Step 6: Map Ensembl IDs to Gene Symbols (with .copy() fix)
+sig_results['Gene_base'] = sig_results['Gene'].str.replace(r'\.\d+$', '', regex=True)
+unique_ensembl_ids = sig_results['Gene_base'].unique().tolist()
+
+mg = mygene.MyGeneInfo()
+gene_info = mg.querymany(unique_ensembl_ids, scopes='ensembl.gene', fields='symbol', species='human')
+
+gene_info_df = pd.DataFrame(gene_info)
+gene_info_df = gene_info_df[gene_info_df['symbol'].notna()][['query', 'symbol']].rename(columns={'query': 'Gene_base', 'symbol': 'Gene_Symbol'})
+
+sig_results = sig_results.merge(gene_info_df, on='Gene_base', how='left')
+
+# Step 7: Save the Results
+sig_results.to_csv('/home/hp/Desktop/RAJESWARI/new_correlation/stage2_significant_microbiome_gene_correlations_1.csv', index=False)
+print("Saved significant correlations with gene symbols.")
