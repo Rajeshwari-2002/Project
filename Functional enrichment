@@ -1,0 +1,201 @@
+sig_cor <- read.csv("/home/hp/Desktop/RAJESWARI/new_correlation/normal_1_significant_microbiome_gene_correlations_1.csv")
+
+taxa_degree <- table(sig_cor$Taxa)
+top20_taxa <- names(sort(taxa_degree, decreasing = TRUE))[1:20]
+top20_sig_cor <- subset(sig_cor, Taxa %in% top20_taxa)
+neighborhoods <- split(top20_sig_cor$Gene_Symbol, top20_sig_cor$Taxa)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+neighborhoods_entrez <- lapply(neighborhoods, function(genes) {
+  mapped <- bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  unique(mapped$ENTREZID)
+})
+
+enrichment_results_BP <- list()
+enrichment_results_MF <- list()
+for (taxon in names(neighborhoods_entrez)) {
+  genes <- neighborhoods_entrez[[taxon]]
+  if (length(genes) < 5) next
+  # Biological Process
+  ego_BP <- enrichGO(
+    gene          = genes,
+    OrgDb         = org.Hs.eg.db,
+    keyType       = "ENTREZID",
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.2,
+    readable      = TRUE
+  )
+  enrichment_results_BP[[taxon]] <- ego_BP
+  # Molecular Function
+  ego_MF <- enrichGO(
+    gene          = genes,
+    OrgDb         = org.Hs.eg.db,
+    keyType       = "ENTREZID",
+    ont           = "MF",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.2,
+    readable      = TRUE
+  )
+  enrichment_results_MF[[taxon]] <- ego_MF
+}
+
+saveRDS(enrichment_results_BP, "normal_enrichment_results_BP.rds")
+saveRDS(enrichment_results_MF, "normal_enrichment_results_MF.rds")
+
+for (taxon in names(enrichment_results_BP)) {
+  ego_BP <- enrichment_results_BP[[taxon]]
+  if (!is.null(ego_BP) && nrow(as.data.frame(ego_BP)) > 0) {
+    write.csv(as.data.frame(ego_BP), paste0("normal_GO_BP_", taxon, ".csv"), row.names = FALSE)
+  }
+}
+
+for (taxon in names(enrichment_results_MF)) {
+  ego_MF <- enrichment_results_MF[[taxon]]
+  if (!is.null(ego_MF) && nrow(as.data.frame(ego_MF)) > 0) {
+    write.csv(as.data.frame(ego_MF), paste0("normal_GO_MF_", taxon, ".csv"), row.names = FALSE)
+  }
+}
+
+#for plotting
+
+#for bp complete
+library(dplyr)
+library(ggplot2)
+library(viridis)
+
+# Combine enrichment results
+all_results_BP <- do.call(rbind, lapply(names(enrichment_results_BP), function(taxon) {
+  ego <- enrichment_results_BP[[taxon]]
+  df <- as.data.frame(ego)
+  if (nrow(df) == 0) return(NULL)
+  df$Microorganism <- taxon
+  df
+}))
+
+# Calculate -log10(FDR)
+all_results_BP$logFDR <- -log10(all_results_BP$p.adjust)
+
+# Extract genus
+all_results_BP$Genus <- sub(".*g__", "", all_results_BP$Microorganism)
+
+# Combine GO term description and GO ID
+all_results_BP$Term <- paste0(all_results_BP$Description, " (", all_results_BP$ID, ")")
+
+# Remove rows with NA in Description or ID
+plot_data_BP <- all_results_BP[!is.na(all_results_BP$Description) & !is.na(all_results_BP$ID), ]
+
+# Set factors for plotting
+plot_data_BP$Genus <- factor(plot_data_BP$Genus, levels = unique(plot_data_BP$Genus))
+plot_data_BP$Term <- factor(plot_data_BP$Term, levels = unique(plot_data_BP$Term))
+
+# Plot
+ggplot(plot_data_BP, aes(x = Genus, y = Term, fill = logFDR)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "magma", name = "-log10(FDR)") +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.y = element_text(size = 10, face = "bold"),
+    axis.text.x = element_text(size = 10, angle = 45, hjust = 1)
+  ) +
+  labs(
+    title = "GO Biological Process Enrichment - NORMAL",
+    x = "Microorganism (Genus)",
+    y = "Biological Process (GO ID)"
+  )
+
+
+#FOR TOP30
+
+top_terms <- plot_data_BP %>%
+  group_by(Term) %>%
+  summarize(max_logFDR = max(logFDR, na.rm = TRUE)) %>%
+  arrange(desc(max_logFDR)) %>%
+  slice(1:30) %>%
+  pull(Term)
+
+plot_data_BP_top <- plot_data_BP %>% filter(Term %in% top_terms)
+
+ggplot(plot_data_BP_top, aes(x = Genus, y = Term, fill = logFDR)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "magma", name = "-log10(FDR)") +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.y = element_text(size = 10, face = "plain"),
+    axis.text.x = element_text(size = 10, angle = 45, hjust = 1, face = "plain")
+  ) +
+  labs(
+    title = "GO Biological Process Enrichment - NORMAL",
+    x = "Microorganism (Genus)",
+    y = "Biological Process (GO ID)"
+  )
+
+
+#for mf complete
+
+all_results_MF <- do.call(rbind, lapply(names(enrichment_results_MF), function(taxon) {
+  ego <- enrichment_results_MF[[taxon]]
+  df <- as.data.frame(ego)
+  if (nrow(df) == 0) return(NULL)
+  df$Microorganism <- taxon
+  df
+}))
+
+# Calculate -log10(FDR)
+all_results_MF$logFDR <- -log10(all_results_MF$p.adjust)
+
+# Extract genus
+all_results_MF$Genus <- sub(".*g__", "", all_results_MF$Microorganism)
+
+# Combine GO term description and GO ID
+all_results_MF$Term <- paste0(all_results_MF$Description, " (", all_results_MF$ID, ")")
+
+# Remove rows with NA in Description or ID
+plot_data_MF <- all_results_MF[!is.na(all_results_MF$Description) & !is.na(all_results_MF$ID), ]
+
+# Set factors for plotting
+plot_data_MF$Genus <- factor(plot_data_MF$Genus, levels = unique(plot_data_MF$Genus))
+plot_data_MF$Term <- factor(plot_data_MF$Term, levels = unique(plot_data_MF$Term))
+
+# Plot
+ggplot(plot_data_MF, aes(x = Genus, y = Term, fill = logFDR)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "magma", name = "-log10(FDR)") +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.y = element_text(size = 10, face = "bold"),
+    axis.text.x = element_text(size = 10, angle = 45, hjust = 1)
+  ) +
+  labs(
+    title = "GO Molecular Function Enrichment - NORMAL",
+    x = "Microorganism (Genus)",
+    y = "Molecular Function (GO ID)"
+  )
+
+
+#FOR TOP30
+
+top_terms <- plot_data_MF %>%
+  group_by(Term) %>%
+  summarize(max_logFDR = max(logFDR, na.rm = TRUE)) %>%
+  arrange(desc(max_logFDR)) %>%
+  slice(1:30) %>%
+  pull(Term)
+
+plot_data_MF_top <- plot_data_MF %>% filter(Term %in% top_terms)
+
+ggplot(plot_data_MF_top, aes(x = Genus, y = Term, fill = logFDR)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "magma", name = "-log10(FDR)") +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.y = element_text(size = 10, face = "plain"),
+    axis.text.x = element_text(size = 10, angle = 45, hjust = 1, face = "plain")
+  ) +
+  labs(
+    title = "GO GO Molecular Function Enrichment - NORMAL",
+    x = "Microorganism (Genus)",
+    y = "Molecular Function (GO ID)"
+  )
