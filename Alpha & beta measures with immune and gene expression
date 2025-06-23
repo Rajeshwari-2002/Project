@@ -1,0 +1,521 @@
+immune_scores_df <- read.csv("/home/hp/Desktop/RAJESWARI/RAJESWARI/immune_infiltration_TIMER.csv")
+immune_scores_df <- t(immune_scores_df)
+rownames(immune_scores_df) <- gsub("\\.", "-", rownames(immune_scores_df))
+write.csv(immune_scores_df, "transposed immune infiltration scpore table.csv")
+alpha_div_df <- read.csv("merged_alpha diversity table.csv")
+immune_scores_df <- read.csv("transposed immune infiltration scpore table.csv")
+# Merge alpha diversity with immune scores
+alpha_immune <- merge(alpha_div_df, immune_scores_df, by = "tcga_barcode")
+
+# Loop over each immune cell and calculate Spearman correlation with each diversity metric
+library(dplyr)
+
+div_measures <- c("Shannon", "Simpson", "richness")  # Replace or add more if needed
+immune_cells <- setdiff(colnames(immune_scores_df), "tcga_barcode") # Exclude SampleID
+
+alpha_immune_results <- data.frame()
+
+for (div in div_measures) {
+  for (cell in immune_cells) {
+    test_res <- cor.test(alpha_immune[[div]], alpha_immune[[cell]], method = "spearman")
+    alpha_immune_results <- rbind(alpha_immune_results, data.frame(
+      Diversity = div,
+      ImmuneCell = cell,
+      Rho = test_res$estimate,
+      p.value = test_res$p.value
+    ))
+  }
+}
+
+# Adjust p-values
+alpha_immune_results$p.adj <- p.adjust(alpha_immune_results$p.value, method = "fdr")
+
+# View results
+print(alpha_immune_results)
+ write.csv(alpha_immune_results, "alpha_immune_results.csv")
+
+ alpha_immune_results <- read.csv("alpha_immune_results.csv")
+ 
+ # 1. Filter significant results if you haven't already
+ sig_immune_results <- alpha_immune_results[alpha_immune_results$p.adj < 0.05, ]
+ 
+ # 2. Sort top 10 positive correlations
+ top10_pos_alpha_immune <- sig_immune_results[order(sig_immune_results$Rho, decreasing = TRUE), ][1:10, ]
+ 
+ # 3. Sort top 10 negative correlations
+ top10_neg_alpha_immune <- sig_immune_results[order(sig_immune_results$Rho, decreasing = FALSE), ][1:10, ]
+ 
+ # 4. Combine both
+ top20_alpha_immune <- rbind(top10_pos_alpha_immune, top10_neg_alpha_immune)
+ 
+ # 5. Print the result
+ print(top20_alpha_immune)
+
+ write.csv(top20_alpha_immune, "top10_positive_negative_alpha_immune_correlations.csv", row.names = FALSE)
+ 
+ library(ggpubr)
+ 
+ plot_list <- list()
+ 
+ for (cell in immune_cells) {
+   # Filter complete cases for current comparison
+   df_subset <- alpha_immune[, c("shannon", cell)]
+   df_subset <- df_subset[complete.cases(df_subset), ]
+   
+   # Ensure both columns are numeric
+   if (!is.numeric(df_subset[[cell]]) || !is.numeric(df_subset$shannon)) {
+     warning(paste("Skipping", cell, "- not numeric"))
+     next
+   }
+   
+   # Calculate Spearman correlation
+   cor_res <- cor.test(df_subset$shannon, df_subset[[cell]], method = "spearman")
+   rho <- round(cor_res$estimate, 3)
+   pval <- signif(cor_res$p.value, 3)
+   
+   # Plot
+   p <- ggplot(df_subset, aes_string(x = "shannon", y = cell)) +
+     geom_point(alpha = 0.6) +
+     geom_smooth(method = "loess", se = TRUE, color = "blue") +
+     labs(
+       title = paste("Shannon vs", gsub("\\.", " ", cell)),
+       x = "Shannon Diversity",
+       y = gsub("\\.", " ", cell)
+     ) +
+     annotate("text", x = min(df_subset$shannon, na.rm = TRUE), 
+              y = max(df_subset[[cell]], na.rm = TRUE),
+              label = paste0("italic(rho) == ", rho, "~','~italic(p) == ", pval),
+              parse = TRUE, hjust = 0) +
+     theme_minimal(base_size = 10)
+   
+   plot_list[[cell]] <- p
+ }
+ library(ggpubr)
+ 
+ # Keep only valid ggplot objects
+ plot_list_clean <- Filter(function(p) inherits(p, "gg"), plot_list)
+ 
+ # Arrange only valid plots
+ combined_plot <- ggarrange(plotlist = plot_list_clean, ncol = 3, nrow = ceiling(length(plot_list_clean)/3))
+ 
+ # Save directly (ggarrange returns a gg object)
+ ggsave("shannon_vs_immune_cells_grid.png", combined_plot, width = 12, height = 8, dpi = 300)
+ print(combined_plot)
+ 
+ 
+ #alpha vs gene exp
+ # Merge alpha diversity with immune gene expression
+ gene_exp <- read.csv("/home/hp/Desktop/RAJESWARI/survival/normalized and variance-stabilized_expression data- complete.csv")
+ 
+ library(biomaRt)
+ # Suppose your expression matrix is called expr_mat
+ # Remove version numbers from column names
+ colnames(gene_exp) <- sub("\\..*", "", colnames(gene_exp))
+ 
+ mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+ conversion <- getBM(
+   attributes = c("ensembl_gene_id", "hgnc_symbol"),
+   filters = "ensembl_gene_id",
+   values = colnames(gene_exp),
+   mart = mart
+ )
+ 
+ # Create a named vector for mapping
+ id_map <- setNames(conversion$hgnc_symbol, conversion$ensembl_gene_id)
+ colnames(gene_exp) <- id_map[colnames(gene_exp)]
+write.csv(gene_exp, "complete_gene_expression_with gene id.csv") 
+ 
+gene_expr_df <- read.csv("complete_gene_expression_with gene id.csv")
+ alpha_gene <- merge(alpha_div_df, gene_expr_df, by = "tcga_barcode")
+ 
+ immune_cells <- setdiff(colnames(gene_expr_df), "tcga_barcode")
+ gene_list <- setdiff(colnames(gene_expr_df), "tcga_barcode")  # Exclude SampleID
+ alpha_gene_results <- data.frame()
+ 
+ for (div in div_measures) {
+   for (gene in gene_list) {
+     res <- cor.test(alpha_gene[[div]], alpha_gene[[gene]], method = "spearman")
+     alpha_gene_results <- rbind(alpha_gene_results, data.frame(
+       Diversity = div,
+       Gene = gene,
+       Rho = res$estimate,
+       p.value = res$p.value
+     ))
+   }
+ }
+ 
+ # Adjust p-values
+ alpha_gene_results$p.adj <- p.adjust(alpha_gene_results$p.value, method = "fdr")
+ 
+ alpha_gene_results <- read.csv("alpha_gene_results.csv")
+ 
+ 
+ # View significant correlations
+ sig_results <- alpha_gene_results %>% filter(p.adj < 0.05)
+
+
+ # Top 10 positive correlations from sig_results
+ top10_pos_alpha_gene <- sig_results[order(sig_results$Rho, decreasing = TRUE), ][1:10, ]
+ 
+ # Top 10 negative correlations from sig_results
+ top10_neg_alpha_gene <- sig_results[order(sig_results$Rho, decreasing = FALSE), ][1:10, ]
+ 
+ # Combine them
+ top20_alpha_gene <- rbind(top10_pos_alpha_gene, top10_neg_alpha_gene)
+ 
+ # View result
+ print(top20_alpha_gene)
+ write.csv(top20_alpha_gene, "top10_positive_negative_alpha_gene_correlations.csv", row.names = FALSE)
+ 
+ write.csv(alpha_gene_results, "alpha_gene_results.csv") 
+metadata <- read.csv("/home/hp/Desktop/RAJESWARI/survival_analysis/Complete_metadata_tcga.csv")
+ alpha_gene <- merge(alpha_gene, metadata, by = "tcga_barcode")
+
+ library(ggplot2)
+ library(ggpubr)
+ library(dplyr)
+ 
+ plot_list <- list()
+ 
+ for (i in seq_len(nrow(sig_results))) {
+   
+   div <- sig_results$Diversity[i]
+   gene <- sig_results$Gene[i]
+   rho <- round(sig_results$Rho[i], 3)
+   pval <- signif(sig_results$p.value[i], 3)
+   
+   # Subset and rename
+   df_plot <- alpha_gene[, c("tcga_barcode", div, gene, "Stage_label")]
+   colnames(df_plot) <- c("tcga_barcode", "Diversity", "GeneExpr", "Stage")
+   
+   # Plot
+   p <- ggplot(df_plot, aes(x = Diversity, y = GeneExpr, color = Stage)) +
+     geom_point(alpha = 0.7) +
+     geom_smooth(method = "loess", se = TRUE, color = "black") +
+     labs(
+       title = paste0(div, " vs ", gene),
+       x = div,
+       y = gene
+     ) +
+     annotate("text",
+              x = min(df_plot$Diversity, na.rm = TRUE),
+              y = max(df_plot$GeneExpr, na.rm = TRUE),
+              label = paste0("italic(rho) == ", rho, "~','~italic(p) == ", pval),
+              parse = TRUE, hjust = 0
+     ) +
+     theme_minimal(base_size = 10) +
+     scale_color_brewer(palette = "Dark2")  # Optional: nice color scheme
+   
+   plot_list[[paste0(div, "_", gene)]] <- p
+ }
+ 
+ combined_plot <- ggarrange(plotlist = plot_list, ncol = 2, nrow = ceiling(length(plot_list) / 2))
+ ggsave("alpha_vs_genes_colored_by_stage.png", combined_plot, width = 12, height = 8, dpi = 300)
+ print(combined_plot)
+ 
+ 
+ library(dplyr)
+ library(ggplot2)
+ library(tidyr)
+ 
+ # Loop through each diversity measure and generate a data frame
+ long_data_list <- list()
+ 
+ div_measures <- unique(sig_results$Diversity)
+ 
+ for (div in div_measures) {
+   genes <- sig_results %>% filter(Diversity == div) %>% pull(Gene)
+   tmp <- alpha_gene %>%
+     dplyr::select(tcga_barcode, Stage, all_of(div), all_of(genes)) %>%
+     pivot_longer(cols = all_of(genes), names_to = "Gene", values_to = "GeneExpr") %>%
+     dplyr::rename(Diversity = !!div)
+   
+   
+   tmp$DiversityMeasure <- div
+   long_data_list[[div]] <- tmp
+ }
+ 
+ # Combine all into one long data frame
+ long_data <- bind_rows(long_data_list)
+ 
+ # Faceted plot
+ ggplot(long_data, aes(x = Diversity, y = GeneExpr, color = Stage)) +
+   geom_point(alpha = 0.6) +
+   geom_smooth(method = "loess", se = TRUE, color = "black") +
+   facet_wrap(~ DiversityMeasure + Gene, scales = "free", ncol = 3) +
+   theme_minimal(base_size = 11) +
+   theme(strip.text = element_text(size = 10), axis.text.x = element_text(angle = 45, hjust = 1)) +
+   labs(
+     title = "Scatter plots of Significant Correlations between Alpha Diversity and Genes",
+     x = "Alpha Diversity Value",
+     y = "Gene Expression"
+   )
+ 
+ 
+ ###beta diversity
+ 
+ bray_dist <- read.csv("/home/hp/Desktop/RAJESWARI/microbiome/converted_beta diversity table.csv")
+ library(ape)        # For pcoa()
+ library(ggplot2)
+ library(dplyr)
+ 
+ library(ape)
+ 
+ # Step 1: Remove duplicates (if any)
+ bray_dist <- bray_dist[!duplicated(bray_dist$tcga_barcode), ]
+ 
+ # Step 2: Extract sample IDs and set as row names
+ rownames(bray_dist) <- bray_dist$tcga_barcode
+ 
+ # Step 3: Drop the first column (sample IDs)
+ bray_clean <- bray_dist[, -1]
+ 
+ # Step 4: Ensure matching row and column names
+ colnames(bray_clean) <- colnames(bray_clean) %>% gsub("\\.", "-", .)  # Fix TCGA ID format
+ sample_ids <- intersect(rownames(bray_clean), colnames(bray_clean))
+ bray_matrix <- as.matrix(bray_clean[sample_ids, sample_ids])
+ 
+ # Step 5: Ensure numeric matrix
+ storage.mode(bray_matrix) <- "numeric"
+ 
+ # Step 6: Convert to distance and run PCoA
+ bray_dist_final <- as.dist(bray_matrix)
+ pcoa_res <- pcoa(bray_dist_final)
+ 
+ # Step 7: Plot
+ biplot(pcoa_res)
+ # Merge with metadata
+ pcoa_df <- as.data.frame(pcoa_res$vectors[, 1:2])
+ pcoa_df$SampleID <- rownames(pcoa_df)
+ pcoa_df <- merge(pcoa_df, metadata, by.x = "SampleID", by.y = "tcga_barcode")
+ 
+ # Plot
+ library(ggplot2)
+ 
+ ggplot(pcoa_df, aes(x = Axis.1, y = Axis.2, color = Stage)) +
+   geom_point(size = 2, alpha = 0.7) +
+   labs(title = "PCoA based on Bray-Curtis Distance",
+        x = paste0("PCoA1 (", round(pcoa_res$values$Relative_eig[1]*100, 1), "%)"),
+        y = paste0("PCoA2 (", round(pcoa_res$values$Relative_eig[2]*100, 1), "%)")) +
+   theme_minimal()
+ 
+ ### Beta Diversity vs Immune Group — PERMANOVA
+ 
+ # Create immune group (e.g., High vs Low CD8 T cell infiltration)
+ immune_scores_df$CD8_group <- ifelse(immune_scores_df$T.cell.CD8. > median(immune_scores_df$T.cell.CD8.), "High", "Low")
+ group_df <- immune_scores_df[, c("tcga_barcode", "CD8_group")]
+ 
+ # Ensure row order matches distance matrix
+ group_df <- group_df[match(labels(bray_dist_final), group_df$SampleID), ]
+ 
+ # Run PERMANOVA
+ library(vegan)
+ adonis_result <- adonis2(bray_dist_final ~ CD8_group, data = group_df)
+ 
+ print(adonis_result)
+ 
+ 
+ # Step 1: Create group based on CD8+ T cell levels
+ immune_scores_df$CD8_group <- ifelse(immune_scores_df$T.cell.CD8. > median(immune_scores_df$T.cell.CD8., na.rm = TRUE), "High", "Low")
+ 
+ # Step 2: Extract required columns
+ group_df <- immune_scores_df[, c("tcga_barcode", "CD8_group")]
+ 
+ # Step 3: Match order with distance matrix
+ sample_labels <- labels(bray_dist_final)
+ group_df <- group_df[match(sample_labels, group_df$tcga_barcode), ]
+ 
+ # Step 4: Check for NA and remove if any
+ valid_idx <- complete.cases(group_df)
+ # Step 1: Convert to full matrix
+ bray_matrix <- as.matrix(bray_dist_final)
+ 
+ # Step 2: Subset the matrix before converting
+ bray_matrix_filtered <- bray_matrix[valid_idx, valid_idx]
+ 
+ # Step 3: Convert the filtered square matrix to 'dist' object
+ bray_dist_filtered <- as.dist(bray_matrix_filtered)
+ 
+ # Step 5: Run PERMANOVA
+ library(vegan)
+ adonis_result <- adonis2(bray_dist_filtered ~ CD8_group, data = group_df)
+ write.csv(adonis_result, "adonis result from permanova_beta diversity.csv")
+ # Step 6: View result
+ print(adonis_result)
+ colnames(pcoa_df)[colnames(pcoa_df) == "SampleID"] <- "tcga_barcode"
+ pcoa_df <- merge(pcoa_df, group_df, by = "tcga_barcode")
+ 
+ pcoa_res <- cmdscale(bray_dist_final, eig = TRUE, k = 2)
+
+  pcoa_df <- data.frame(SampleID = rownames(pcoa_res$points),
+                       PC1 = pcoa_res$points[,1],
+                       PC2 = pcoa_res$points[,2])
+  colnames(pcoa_df)[colnames(pcoa_df) == "SampleID"] <- "tcga_barcode"
+  pcoa_df <- merge(pcoa_df, group_df, by = "tcga_barcode")
+  
+ 
+ ggplot(pcoa_df, aes(x = PC1, y = PC2, color = CD8_group)) +
+   geom_point(size = 3) +
+   labs(title = "PCoA (Bray-Curtis) by CD8 T Cell Group") +
+   theme_minimal()
+ 
+ ##to check through all immune cells
+ 
+ library(vegan)
+ 
+ immune_cell_types <- colnames(immune_scores_df)[colnames(immune_scores_df) %in% c("B.cell", "T.cell.CD4.", "T.cell.CD8.", "Neutrophil", "Macrophage", "Myeloid.dendritic.cell")]
+ 
+ perm_results <- data.frame(Cell_Type = character(),
+                            F_stat = numeric(),
+                            R2 = numeric(),
+                            p_value = numeric(),
+                            stringsAsFactors = FALSE)
+ 
+ for (cell in immune_cell_types) {
+   cat("\nProcessing:", cell, "\n")
+   
+   # Skip if all NA
+   if (all(is.na(immune_scores_df[[cell]]))) {
+     cat("Skipping", cell, " — all values are NA\n")
+     next
+   }
+   
+   # Create group
+   immune_scores_df$group <- ifelse(immune_scores_df[[cell]] > median(immune_scores_df[[cell]], na.rm = TRUE), "High", "Low")
+   group_df <- immune_scores_df[, c("tcga_barcode", "group")]
+   
+   # Match to distance matrix
+   group_df <- group_df[match(labels(bray_dist_final), group_df$tcga_barcode), ]
+   
+   # Remove NA
+   valid_idx <- complete.cases(group_df)
+   
+   if (sum(valid_idx) < 10) {
+     cat("Skipping", cell, " — too few valid samples (", sum(valid_idx), ")\n")
+     next
+   }
+   
+   # Subset matrix
+   bray_mat <- as.matrix(bray_dist_final)
+   bray_mat <- bray_mat[valid_idx, valid_idx]
+   group_df <- group_df[valid_idx, ]
+   
+   # Ensure 2 groups exist
+   if (length(unique(group_df$group)) < 2) {
+     cat("Skipping", cell, " — only one group present\n")
+     next
+   }
+   
+   # Compute PERMANOVA
+   bray_dist_filtered <- as.dist(bray_mat)
+   adonis_out <- adonis2(bray_dist_filtered ~ group, data = group_df)
+   
+   perm_results <- rbind(perm_results, data.frame(
+     Cell_Type = cell,
+     F_stat = adonis_out$F[1],
+     R2 = adonis_out$R2[1],
+     p_value = adonis_out$`Pr(>F)`[1]
+   ))
+ }
+ 
+ # Sort results by significance
+ perm_results <- perm_results[order(perm_results$p_value), ]
+ print(perm_results)
+ 
+ 
+ 
+ ###plot for all immune cells
+ cd8_row <- data.frame(
+   Cell_Type = "T.cell.CD8.",
+   F_stat = 6.7677,
+   R2 = 0.012996,
+   p_value = 0.001
+ )
+ 
+ # Combine with your existing perm_results
+ perm_results_combined <- rbind(cd8_row, perm_results)
+ library(ggplot2)
+ 
+ ggplot(perm_results_combined, aes(x = reorder(Cell_Type, -R2), y = R2, fill = p_value < 0.05)) +
+   geom_bar(stat = "identity") +
+   geom_text(aes(label = paste0("F=", round(F_stat, 2), ", p=", signif(p_value, 2))), 
+             vjust = -0.5, size = 3.5) +
+   scale_fill_manual(values = c("TRUE" = "#1b9e77", "FALSE" = "#d95f02"),
+                     labels = c("Not significant", "Significant")) +
+   labs(title = "PERMANOVA Results: Microbiome Beta Diversity vs Immune Cells",
+        x = "Immune Cell Type", y = "Explained Variance (R²)",
+        fill = "Significance (p < 0.05)") +
+   theme_minimal() +
+   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+   
+ #to plot based on p value
+ ggplot(perm_results_combined, aes(x = reorder(Cell_Type, p_value), y = R2, fill = p_value < 0.05)) + ...
+ 
+ 
+ ###beta diversity vs gene exp
+ 
+ library(vegan)
+ 
+ # Get gene list (exclude tcga_barcode column)
+ genes_to_test <- colnames(gene_expr_df)[colnames(gene_expr_df) != "tcga_barcode"]
+ 
+ # Initialize results dataframe
+ gene_perm_results <- data.frame(Gene = character(),
+                                 F_stat = numeric(),
+                                 R2 = numeric(),
+                                 p_value = numeric(),
+                                 stringsAsFactors = FALSE)
+ 
+ for (gene in genes_to_test) {
+   
+   # Create group: High vs Low expression
+   gene_df <- gene_expr_df[, c("tcga_barcode", gene)]
+   colnames(gene_df)[2] <- "expr"
+   gene_df$group <- ifelse(gene_df$expr > median(gene_df$expr, na.rm = TRUE), "High", "Low")
+   
+   # Match sample order to bray distance
+   gene_df <- gene_df[match(labels(bray_dist_final), gene_df$tcga_barcode), ]
+   
+   # Remove missing
+   valid_idx <- complete.cases(gene_df)
+   if (sum(valid_idx) < 10) next  # skip if too few
+   
+   group_df <- gene_df[valid_idx, ]
+   bray_mat <- as.matrix(bray_dist_final)[valid_idx, valid_idx]
+   bray_dist_filtered <- as.dist(bray_mat)
+   
+   # Skip if only one group
+   if (length(unique(group_df$group)) < 2) next
+   
+   # PERMANOVA
+   adonis_out <- adonis2(bray_dist_filtered ~ group, data = group_df)
+   
+   # Store result
+   gene_perm_results <- rbind(gene_perm_results, data.frame(
+     Gene = gene,
+     F_stat = adonis_out$F[1],
+     R2 = adonis_out$R2[1],
+     p_value = adonis_out$`Pr(>F)`[1]
+   ))
+ }
+ 
+# Sort and View Significant Genes
+
+ gene_perm_results <- gene_perm_results[order(gene_perm_results$p_value), ]
+ head(gene_perm_results, 10)
+ 
+ write.csv(gene_perm_results, "beta_gene_perm_results.csv")
+ library(ggplot2)
+ 
+ top_genes <- head(gene_perm_results, 10)
+ 
+ ggplot(top_genes, aes(x = reorder(Gene, -R2), y = R2, fill = p_value < 0.05)) +
+   geom_bar(stat = "identity") +
+   geom_text(aes(label = paste0("F=", round(F_stat, 2), ", p=", signif(p_value, 2))), 
+             vjust = -0.5, size = 3.5) +
+   scale_fill_manual(values = c("TRUE" = "#1b9e77", "FALSE" = "#d95f02")) +
+   labs(title = "Beta Diversity vs Gene Expression (PERMANOVA)",
+        x = "Gene", y = "Explained Variance (R²)",
+        fill = "Significant (p < 0.05)") +
+   theme_minimal() +
+   theme(axis.text.x = element_text(angle = 45, hjust = 1))
