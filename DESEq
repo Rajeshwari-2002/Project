@@ -1,0 +1,66 @@
+#DEG 
+library(DESeq2)
+library(tidyverse)
+# making sure the row names in colData matches to column names in Expression
+all(colnames(Expression) %in% rownames(coldata))
+# are they in the same order?
+all(colnames(Expression) == rownames(coldata))
+
+# construct a DESeqDataSet object ----------
+dds <- DESeqDataSetFromMatrix(countData = Expression,
+                              colData = coldata,
+                              design = ~ sample_type)
+# pre-filtering: removing rows with low gene counts
+# keeping rows that have at least 10 reads total
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+
+dds <- DESeq(dds)
+res <- results(dds)
+summary(res)
+saveRDS(res, file = "res.rds")
+
+# Convert to data frame and add gene_id
+res1 <- as.data.frame(res)
+res1$gene_id <- rownames(res1)
+saveRDS(res1, file = "res1.rds")
+# Add gene type and filter for protein coding
+res1$gene_type <- Gene_metadata$gene_type[match(res1$gene_id, Gene_metadata$gene_id)]
+res1 <- res1[res1$gene_type == "protein_coding", ]
+
+# Filter for significant genes
+res1_filtered <- res1[res1$padj < 0.05 & abs(res1$log2FoldChange) > 1, ]
+
+# Add gene name
+res1_filtered$gene_name <- Gene_metadata$gene_name[match(res1_filtered$gene_id, Gene_metadata$gene_id)]
+head(res1_filtered[order(res1_filtered$log2FoldChange, decreasing = TRUE), ], 10)  # Top upregulated
+#to save the top10 upregulated gene
+top_up <- head(res1_filtered[order(res1_filtered$log2FoldChange, decreasing = TRUE), ], 10)
+write.csv(top_up, file = "top10_upregulated_genes.csv", row.names = TRUE)
+#to save top10 down regulated genes
+head(res1_filtered[order(res1_filtered$log2FoldChange), ], 10)  # Top downregulated
+write.csv(top_down, file = "top10_downregulated_genes.csv", row.names = TRUE)
+
+write.csv(res1_filtered, "TCGA_LUAD_DEGs_filtered.csv", row.names = FALSE)
+saveRDS(res1_filtered, "TCGA_LUAD_DEGs_filtered.rds")
+
+# to save all upregulated and down regulated genes
+upregulated_genes <- res1_filtered[res1_filtered$log2FoldChange > 0, ]
+write.csv(upregulated_genes, file = "all_upregulated_genes.csv", row.names = TRUE)
+
+downregulated_genes <- res1_filtered[res1_filtered$log2FoldChange < 0, ]
+write.csv(downregulated_genes, file = "all_downregulated_genes.csv", row.names = TRUE)
+
+# to plot volcanoplot
+BiocManager::install("EnhancedVolcano")
+library(EnhancedVolcano)
+
+volcano_plot <- EnhancedVolcano(res1,
+                                lab = rep("", nrow(res1)),
+                                x = "log2FoldChange",
+                                y = "padj",
+                                pCutoff = 0.05,
+                                FCcutoff = 1,
+                                title = "Differential Expression in TCGA-LUAD")
+
+ggsave("volcano_plot2.png", plot = volcano_plot, width = 8, height = 6, dpi = 300)
