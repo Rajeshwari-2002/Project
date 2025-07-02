@@ -1,0 +1,67 @@
+library(immunedeconv)
+#ensmbl id to gene id
+library(biomaRt)
+
+# Strip version from Ensembl IDs
+genes <- rownames(dds)
+genes_clean <- sub("\\..*", "", genes)
+
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = genes_clean,
+  mart = ensembl
+)
+
+# Create a clean mapping
+gene_map <- gene_map[!duplicated(gene_map$ensembl_gene_id), ]
+rownames(gene_map) <- gene_map$ensembl_gene_id
+gene_symbols <- gene_map[genes_clean, "hgnc_symbol"]
+
+# vst
+vsd <- vst(dds, blind = FALSE)
+expr_mat <- assay(vsd)
+
+# Add gene symbols as rownames
+rownames(expr_mat) <- gene_symbols
+
+# Remove genes without a symbol
+expr_mat <- expr_mat[!is.na(rownames(expr_mat)) & rownames(expr_mat) != "", ]
+#run timer
+result_timer <- deconvolute(expr_mat, method = "timer")
+#(found an error so)
+#Check orientation of your matrix
+dim(expr_mat)        # Should return (genes, samples)
+head(rownames(expr_mat))  # Should be gene symbols
+head(colnames(expr_mat))  # Should be TCGA sample barcodes
+#(format correct then)
+result_timer <- deconvolute(expr_mat, method = "timer", indications = rep("LUAD", ncol(expr_mat)))
+# ( found an error- Remove duplicated gene names from expr_mat
+expr_mat <- expr_mat[!duplicated(rownames(expr_mat)), ]
+#recheck
+sum(duplicated(rownames(expr_mat)))  # Should return 0
+# then re run the time
+result_timer <- deconvolute(expr_mat, method = "timer", indications = rep("LUAD", ncol(expr_mat)))
+saveRDS(result_timer, file = "immune_infiltration_TIMER.rds")
+# to get the saved file
+result_timer <- readRDS("immune_infiltration_TIMER.rds")
+write.csv(result_timer, file = "immune_infiltration_TIMER.csv", row.names = FALSE)
+#Visualize immune infiltration
+library(pheatmap)
+immune_matrix <- as.matrix(result_timer[, -1])  # remove cell type column
+rownames(immune_matrix) <- result_timer$cell_type
+
+pheatmap(immune_matrix, cluster_rows = TRUE, cluster_cols = TRUE, 
+         main = "Immune Cell Infiltration Heatmap")
+
+# Open PNG device first
+png("immune_infiltration_heatmap.png", width = 1000, height = 800)
+ # Now generate the plot inside the PNG
+  pheatmap(immune_matrix,
+             +          cluster_rows = TRUE,
+             +          cluster_cols = FALSE,
+             +          main = "Immune Cell Infiltration Heatmap",
+             +          show_colnames = FALSE)
+   # Close the device to write the image file
+   dev.off()
