@@ -1,0 +1,18 @@
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(pheatmap)
+library(tidyverse)
+
+query <- GDCquery(project = "TCGA-LUAD",
+                  data.category = "Transcriptome Profiling",
+                  data.type = "Gene Expression Quantification",
+                  workflow.type = "STAR - Counts")
+GDCdownload(query)
+data <- GDCprepare(query)
+# load saved data
+data <- readRDS("/home/hp/tcga_luad_gene_expressionDATA.rds")
+Expression <- assay(data) 
+Expression <- data.frame(Expression)
+coldata <- colData(data) 
+coldata <- data.frame(coldata)
+Gene_metadata <- rowData(data)
