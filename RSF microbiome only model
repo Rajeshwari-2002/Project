@@ -1,0 +1,135 @@
+library(survival)
+library(glmnet)
+library(survminer)
+library(caret)
+library(dplyr)
+library(randomForestSRC)
+library(timeROC)
+
+# --- 1. Load microbiome and clinical data ---
+microbiome_df <- read.csv("/home/hp/Desktop/RAJESWARI/survival/complete_microbiome_clr transformed_table.csv", stringsAsFactors = FALSE)
+clinical_df <- read.csv("edited_by deletion_metadata.csv", stringsAsFactors = FALSE)
+
+# Remove duplicates
+microbiome_df <- microbiome_df[!duplicated(microbiome_df$tcga_barcode), ]
+clinical_df <- clinical_df[!duplicated(clinical_df$tcga_barcode), ]
+
+# Set rownames and remove barcode columns
+rownames(microbiome_df) <- microbiome_df$tcga_barcode
+rownames(clinical_df) <- clinical_df$tcga_barcode
+microbiome_df$tcga_barcode <- NULL
+clinical_df$tcga_barcode <- NULL
+
+# Rename survival columns if needed
+if ("Overall.Survival..Months." %in% colnames(clinical_df)) {
+  colnames(clinical_df)[colnames(clinical_df) == "Overall.Survival..Months."] <- "OS"
+}
+if (!"OS" %in% colnames(clinical_df)) stop("OS column not found in clinical data.")
+if (!"event_status" %in% colnames(clinical_df)) stop("event_status column not found in clinical data.")
+
+# Ensure event_status is 0/1 numeric
+clinical_df$event_status <- as.numeric(clinical_df$event_status)
+stopifnot(all(clinical_df$event_status %in% c(0, 1)))
+
+# Keep only common samples
+common_ids <- intersect(rownames(microbiome_df), rownames(clinical_df))
+microbiome_df <- microbiome_df[common_ids, , drop = FALSE]
+clinical_df <- clinical_df[common_ids, , drop = FALSE]
+
+# --- 2. Preprocess microbiome features ---
+microbiome_df <- microbiome_df[, apply(microbiome_df, 2, function(x) length(unique(na.omit(x))) > 1)]
+microbiome_df <- microbiome_df[, colMeans(is.na(microbiome_df)) < 0.2]
+microbiome_df <- as.data.frame(lapply(microbiome_df, function(x) { x[is.na(x)] <- median(x, na.rm = TRUE); x }))
+microbiome_df <- as.data.frame(scale(microbiome_df))
+
+# Preprocess clinical variables
+clinical_df$Stage <- as.factor(as.character(clinical_df$Stage))
+clinical_df$gender <- as.factor(as.character(clinical_df$gender))
+clinical_df$age <- as.numeric(clinical_df$age)
+clinical_df$age <- scale(clinical_df$age)
+
+# Remove samples with OS <= 0
+valid_idx <- which(clinical_df$OS > 0)
+microbiome_df <- microbiome_df[valid_idx, , drop = FALSE]
+clinical_df <- clinical_df[valid_idx, , drop = FALSE]
+
+# --- 3. Prepare survival outcome ---
+y <- Surv(clinical_df$OS, clinical_df$event_status)
+
+# --- 4. Feature selection with Elastic Net on microbiome data ---
+set.seed(42)
+cvfit <- cv.glmnet(as.matrix(microbiome_df), y, family = "cox", alpha = 0.5, nfolds = 5)
+best_lambda <- cvfit$lambda.min
+enet_fit <- glmnet(as.matrix(microbiome_df), y, family = "cox", alpha = 0.5, lambda = best_lambda)
+microbiome_coefs <- coef(enet_fit)
+selected_microbes <- rownames(microbiome_coefs)[as.numeric(microbiome_coefs) != 0]
+
+cat("Number of microbiome features selected by Elastic Net:", length(selected_microbes), "\n")
+if (length(selected_microbes) == 0) stop("No microbiome features selected by Elastic Net.")
+print(selected_microbes)
+
+# Subset microbiome data to selected features only
+microbiome_sel <- microbiome_df[, selected_microbes, drop = FALSE]
+
+# --- 5. One-hot encode Stage and gender ---
+dummies <- model.matrix(~ Stage + gender - 1, data = clinical_df)
+stage_gender_cols <- colnames(dummies)
+
+# --- 6. Combine clinical variables and selected microbiome features ---
+model_df <- cbind(
+  clinical_df[, c("OS", "event_status", "age")],
+  dummies,
+  microbiome_sel
+)
+colnames(model_df) <- make.names(colnames(model_df))
+stopifnot(!any(is.na(model_df)))
+
+# --- 7. Train/test split ---
+set.seed(42)
+train_idx <- createDataPartition(model_df$event_status, p = 0.7, list = FALSE)
+train_df <- model_df[train_idx, ]
+test_df <- model_df[-train_idx, ]
+train_df <- train_df[train_df$OS > 0, ]
+colnames(train_df) <- make.names(colnames(train_df))
+colnames(test_df) <- make.names(colnames(test_df))
+
+# --- 8. RSF Modeling ---
+library(randomForestSRC)
+set.seed(42)
+rsf_model <- rfsrc(Surv(OS, event_status) ~ ., data = train_df, ntree = 1000, importance = TRUE, na.action = "na.impute")
+
+# --- 9. Predict risk and evaluate ---
+train_pred_rsf <- predict(rsf_model, newdata = train_df)$predicted
+test_pred_rsf  <- predict(rsf_model, newdata = test_df)$predicted
+
+# Concordance Index
+cindex_train <- survConcordance(Surv(train_df$OS, train_df$event_status) ~ train_pred_rsf)$concordance
+cindex_test  <- survConcordance(Surv(test_df$OS, test_df$event_status) ~ test_pred_rsf)$concordance
+cat(sprintf("RSF Train Concordance Index: %.3f\n", cindex_train))
+cat(sprintf("RSF Test Concordance Index: %.3f\n", cindex_test))
+
+# --- 10. Time-dependent ROC ---
+library(timeROC)
+roc_train <- timeROC(T = train_df$OS, delta = train_df$event_status, marker = train_pred_rsf, cause = 1, times = c(12, 24, 36), iid = TRUE)
+roc_test  <- timeROC(T = test_df$OS,  delta = test_df$event_status,  marker = test_pred_rsf,  cause = 1, times = c(12, 24, 36), iid = TRUE)
+
+plot(roc_train, time = 12, col = "blue", title = "RSF 12-Month ROC (Microbiome + Clinical)")
+plot(roc_test, time = 12, add = TRUE, col = "red")
+legend("bottomright", legend = c("Train", "Test"), col = c("blue", "red"), lty = 1)
+text(0.6, 0.2, paste0("Train AUC = ", round(roc_train$AUC[1], 3)), col = "blue", cex = 0.9)
+text(0.6, 0.15, paste0("Test AUC = ", round(roc_test$AUC[1], 3)), col = "red", cex = 0.9)
+
+# --- 11. C-index Bar Plot ---
+bar_vals <- c(cindex_train, cindex_test)
+bar_names <- c("Train", "Test")
+bar_colors <- c("skyblue", "orange")
+bp <- barplot(bar_vals, names.arg = bar_names, ylim = c(0, 1),
+              col = bar_colors, ylab = "C-index", main = "C-index for Microbiome RSF Model")
+abline(h = 0.5, lty = 2, col = "red")
+text(x = bp, y = bar_vals, labels = sprintf("%.3f", bar_vals), pos = 3, cex = 1.2, col = "black")
+
+# --- 12. Kaplan-Meier curve by risk group ---
+median_risk <- median(test_pred_rsf)
+test_df$risk_group <- ifelse(test_pred_rsf > median_risk, "High", "Low")
+fit_km <- survfit(Surv(OS, event_status) ~ risk_group, data = test_df)
+ggsurvplot(fit_km, data = test_df, pval = TRUE, risk.table = TRUE, title = "RSF: KM Survival by Risk Group")
