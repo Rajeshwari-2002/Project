@@ -1,0 +1,129 @@
+library(survival)
+library(glmnet)
+library(survminer)
+library(caret)
+library(dplyr)
+library(randomForestSRC)
+library(timeROC)
+
+# --- 1. Load and Clean Data ---
+gene_df <- read.csv("gene expression with gene map.csv", stringsAsFactors = FALSE)
+clinical_df <- read.csv("edited_by deletion_metadata.csv", stringsAsFactors = FALSE)
+
+gene_df <- gene_df[!duplicated(gene_df$tcga_barcode), ]
+clinical_df <- clinical_df[!duplicated(clinical_df$tcga_barcode), ]
+
+rownames(gene_df) <- gene_df$tcga_barcode
+rownames(clinical_df) <- clinical_df$tcga_barcode
+gene_df$tcga_barcode <- NULL
+clinical_df$tcga_barcode <- NULL
+
+if ("Overall.Survival..Months." %in% colnames(clinical_df)) {
+  colnames(clinical_df)[colnames(clinical_df) == "Overall.Survival..Months."] <- "OS"
+}
+if (!"OS" %in% colnames(clinical_df)) stop("OS column not found in clinical data.")
+if (!"event_status" %in% colnames(clinical_df)) stop("event_status column not found in clinical data.")
+
+clinical_df$event_status <- as.numeric(clinical_df$event_status)
+stopifnot(all(clinical_df$event_status %in% c(0, 1)))
+
+common_ids <- intersect(rownames(gene_df), rownames(clinical_df))
+gene_df <- gene_df[common_ids, , drop = FALSE]
+clinical_df <- clinical_df[common_ids, , drop = FALSE]
+
+# Remove genes with no variation or too many NAs
+gene_df <- gene_df[, apply(gene_df, 2, function(x) length(unique(na.omit(x))) > 1)]
+gene_df <- gene_df[, colMeans(is.na(gene_df)) < 0.2]
+
+# Impute missing values with median, then scale
+gene_df <- as.data.frame(lapply(gene_df, function(x) {
+  x[is.na(x)] <- median(x, na.rm = TRUE)
+  x
+}))
+gene_df <- as.data.frame(scale(gene_df))
+
+clinical_df$Stage <- as.factor(as.character(clinical_df$Stage))
+clinical_df$gender <- as.factor(as.character(clinical_df$gender))
+clinical_df$age <- as.numeric(clinical_df$age)
+clinical_df$age <- scale(clinical_df$age)
+
+# Remove samples with OS <= 0
+valid_idx <- which(clinical_df$OS > 0)
+gene_df <- gene_df[valid_idx, , drop = FALSE]
+clinical_df <- clinical_df[valid_idx, , drop = FALSE]
+
+# Prepare survival outcome
+y <- Surv(clinical_df$OS, clinical_df$event_status)
+
+# --- 2. Elastic Net Feature Selection ---
+set.seed(42)
+cvfit <- cv.glmnet(as.matrix(gene_df), y, family = "cox", alpha = 0.5, nfolds = 5)
+best_lambda <- cvfit$lambda.min
+enet_fit <- glmnet(as.matrix(gene_df), y, family = "cox", alpha = 0.5, lambda = best_lambda)
+gene_coefs <- coef(enet_fit)
+selected_genes <- rownames(gene_coefs)[as.numeric(gene_coefs) != 0]
+
+cat("Number of genes selected by Elastic Net:", length(selected_genes), "\n")
+if (length(selected_genes) == 0) stop("No genes selected by Elastic Net.")
+print(selected_genes)
+
+# Subset gene_df to selected genes only
+gene_df_sel <- gene_df[, selected_genes, drop = FALSE]
+
+# --- 3. Prepare Modeling Data (Clinical + Selected Genes) ---
+dummies <- model.matrix(~ Stage + gender - 1, data = clinical_df)
+model_df <- cbind(
+  clinical_df[, c("OS", "event_status", "age")],
+  dummies,
+  gene_df_sel
+)
+colnames(model_df) <- make.names(colnames(model_df))
+stopifnot(!any(is.na(model_df)))
+
+# --- 4. Train/Test Split ---
+set.seed(42)
+train_idx <- createDataPartition(model_df$event_status, p = 0.7, list = FALSE)
+train_df <- model_df[train_idx, ]
+test_df <- model_df[-train_idx, ]
+train_df <- train_df[train_df$OS > 0, ]
+colnames(train_df) <- make.names(colnames(train_df))
+colnames(test_df) <- make.names(colnames(test_df))
+
+# --- 5. RSF Modeling on Selected Features ---
+set.seed(42)
+rsf_model <- rfsrc(Surv(OS, event_status) ~ ., data = train_df, ntree = 1000, importance = TRUE, na.action = "na.impute")
+
+# --- 6. Predict Risk Scores ---
+train_pred_rsf <- predict(rsf_model, newdata = train_df)$predicted
+test_pred_rsf  <- predict(rsf_model, newdata = test_df)$predicted
+
+# --- 7. C-index Calculation ---
+cindex_train <- survConcordance(Surv(train_df$OS, train_df$event_status) ~ train_pred_rsf)$concordance
+cindex_test  <- survConcordance(Surv(test_df$OS, test_df$event_status) ~ test_pred_rsf)$concordance
+cat(sprintf("RSF Train Concordance Index: %.3f\n", cindex_train))
+cat(sprintf("RSF Test Concordance Index: %.3f\n", cindex_test))
+
+# --- 8. Time-dependent ROC Curves ---
+roc_train <- timeROC(T = train_df$OS, delta = train_df$event_status, marker = train_pred_rsf, cause = 1, times = c(12, 24, 36), iid = TRUE)
+roc_test  <- timeROC(T = test_df$OS,  delta = test_df$event_status,  marker = test_pred_rsf,  cause = 1, times = c(12, 24, 36), iid = TRUE)
+
+plot(roc_train, time = 12, col = "blue", title = "RSF 12-Month ROC (Gene + Clinical)")
+plot(roc_test, time = 12, add = TRUE, col = "red")
+legend("bottomright", legend = c("Train", "Test"), col = c("blue", "red"), lty = 1)
+text(0.6, 0.2, paste0("Train AUC = ", round(roc_train$AUC[1], 3)), col = "blue", cex = 0.9)
+text(0.6, 0.15, paste0("Test AUC = ", round(roc_test$AUC[1], 3)), col = "red", cex = 0.9)
+
+# --- 9. C-index Bar Plot ---
+bar_vals <- c(cindex_train, cindex_test)
+bar_names <- c("Train", "Test")
+bar_colors <- c("skyblue", "orange")
+bp <- barplot(bar_vals, names.arg = bar_names, ylim = c(0, 1),
+              col = bar_colors, ylab = "C-index", main = "C-index for Train and Test Sets")
+abline(h = 0.5, lty = 2, col = "red")
+text(x = bp, y = bar_vals, labels = sprintf("%.3f", bar_vals), pos = 3, cex = 1.2, col = "black")
+
+# --- 10. KM Curve for Risk Stratification ---
+median_risk <- median(test_pred_rsf)
+test_df$risk_group <- ifelse(test_pred_rsf > median_risk, "High", "Low")
+fit_km <- survfit(Surv(OS, event_status) ~ risk_group, data = test_df)
+ggsurvplot(fit_km, data = test_df, pval = TRUE, risk.table = TRUE, title = "RSF: KM Survival by Risk Group")
