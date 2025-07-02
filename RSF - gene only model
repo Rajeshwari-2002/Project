@@ -1,0 +1,142 @@
+library(survival)
+library(glmnet)
+library(survminer)
+library(caret)
+library(dplyr)
+library(randomForestSRC)
+library(timeROC)
+
+# --- 1. Load and Clean Data ---
+micro_df <- read.csv("/home/hp/Desktop/RAJESWARI/survival/complete_microbiome_clr transformed_table.csv", stringsAsFactors = FALSE)
+gene_df <- read.csv("gene expression with gene map.csv", stringsAsFactors = FALSE)
+clinical_df <- read.csv("edited_by deletion_metadata.csv", stringsAsFactors = FALSE)
+
+micro_df <- micro_df[!duplicated(micro_df$tcga_barcode), ]
+gene_df <- gene_df[!duplicated(gene_df$tcga_barcode), ]
+clinical_df <- clinical_df[!duplicated(clinical_df$tcga_barcode), ]
+
+rownames(micro_df) <- micro_df$tcga_barcode
+rownames(gene_df) <- gene_df$tcga_barcode
+rownames(clinical_df) <- clinical_df$tcga_barcode
+micro_df$tcga_barcode <- NULL
+gene_df$tcga_barcode <- NULL
+clinical_df$tcga_barcode <- NULL
+
+if("Overall.Survival..Months." %in% colnames(clinical_df)){
+  colnames(clinical_df)[colnames(clinical_df) == "Overall.Survival..Months."] <- "OS"
+} else {
+  stop("Column Overall.Survival..Months. not found in clinical data")
+}
+
+common_ids <- Reduce(intersect, list(rownames(micro_df), rownames(gene_df), rownames(clinical_df)))
+micro_df <- micro_df[common_ids, , drop=FALSE]
+gene_df <- gene_df[common_ids, , drop=FALSE]
+clinical_df <- clinical_df[common_ids, , drop=FALSE]
+
+merged_df <- cbind(clinical_df[, c("OS", "event_status", "age", "Stage")], micro_df, gene_df)
+merged_df$Stage <- as.factor(as.character(merged_df$Stage))
+
+# --- 2. Feature Preprocessing ---
+feature_df <- merged_df[, !(colnames(merged_df) %in% c("OS", "event_status", "age", "Stage"))]
+feature_df <- feature_df[, apply(feature_df, 2, function(x) length(unique(na.omit(x))) > 1)]
+feature_df <- feature_df[, colMeans(is.na(feature_df)) < 0.2]
+
+impute_median <- function(x) replace(x, is.na(x), median(x, na.rm=TRUE))
+feature_df <- as.data.frame(lapply(feature_df, impute_median))
+feature_df <- as.data.frame(scale(feature_df))
+
+merged_df$age <- scale(merged_df$age)
+model_df <- cbind(merged_df[, c("OS", "event_status", "Stage")], age = merged_df$age, feature_df)
+
+dummies <- model.matrix(~ Stage - 1, data = model_df)
+dummies <- dummies[, -1, drop=FALSE]
+model_df <- cbind(model_df[, !colnames(model_df) %in% "Stage"], dummies)
+
+# --- 3. Train/Test Split ---
+set.seed(42)
+train_idx <- createDataPartition(model_df$event_status, p=0.7, list=FALSE)
+train_df <- model_df[train_idx, ]
+test_df <- model_df[-train_idx, ]
+train_df <- train_df[train_df$OS > 0, ]
+
+x_train <- as.matrix(train_df[, !(colnames(train_df) %in% c("OS", "event_status"))])
+y_train <- Surv(train_df$OS, train_df$event_status)
+
+x_test <- as.matrix(test_df[, !(colnames(test_df) %in% c("OS", "event_status"))])
+y_test <- Surv(test_df$OS, test_df$event_status)
+
+# --- 4. Feature Selection using Elastic Net ---
+cvfit <- cv.glmnet(x_train, y_train, family = "cox", alpha = 0.5, nfolds = 5)
+best_lambda <- cvfit$lambda.min
+enet_fit <- glmnet(x_train, y_train, family = "cox", alpha = 0.5, lambda = best_lambda)
+coef_enet <- coef(enet_fit)
+selected_features <- rownames(coef_enet)[as.numeric(coef_enet) != 0]
+selected_features <- selected_features[selected_features != "(Intercept)"]
+cat("Number of features selected by Elastic Net:", length(selected_features), "\n")
+print(selected_features)
+
+# --- 5. Subset Data to Selected Features ---
+selected_train_df <- train_df[, c("OS", "event_status", selected_features), drop=FALSE]
+selected_test_df  <- test_df[,  c("OS", "event_status", selected_features), drop=FALSE]
+
+# --- 6. Fit RSF Model on Selected Features ---
+set.seed(42)
+rsf_model <- rfsrc(Surv(OS, event_status) ~ ., data = selected_train_df, ntree = 1000, importance = TRUE, na.action = "na.impute")
+
+# --- 7. Predict and Evaluate ---
+# Predict on train and test sets
+train_pred_rsf <- predict(rsf_model, newdata = selected_train_df)$predicted
+test_pred_rsf  <- predict(rsf_model, newdata = selected_test_df)$predicted
+
+# Concordance Index (C-index)
+train_cindex <- survConcordance(Surv(selected_train_df$OS, selected_train_df$event_status) ~ train_pred_rsf)$concordance
+test_cindex  <- survConcordance(Surv(selected_test_df$OS, selected_test_df$event_status) ~ test_pred_rsf)$concordance
+cat(sprintf("RSF Train Concordance Index: %.3f\n", train_cindex))
+cat(sprintf("RSF Test Concordance Index: %.3f\n", test_cindex))
+
+# Prepare data for plotting
+cindex_vals <- c(train_cindex, test_cindex)
+names(cindex_vals) <- c("Train", "Test")
+bar_colors <- c("skyblue", "orange")
+
+# Create bar plot
+bp <- barplot(
+  cindex_vals,
+  names.arg = names(cindex_vals),
+  ylim = c(0, 1),
+  col = bar_colors,
+  ylab = "C-index",
+  main = "C-index for RSF Model (Train vs Test)"
+)
+abline(h = 0.5, lty = 2, col = "red")  # Reference line for random model
+text(x = bp, y = cindex_vals, labels = sprintf("%.3f", cindex_vals), pos = 3, cex = 1.2, col = "black")
+
+# --- 8. ROC Curves ---
+library(timeROC)
+roc_train <- timeROC(
+  T = selected_train_df$OS,
+  delta = selected_train_df$event_status,
+  marker = train_pred_rsf,
+  cause = 1,
+  times = c(12, 24, 36),
+  iid = TRUE
+)
+roc_test <- timeROC(
+  T = selected_test_df$OS,
+  delta = selected_test_df$event_status,
+  marker = test_pred_rsf,
+  cause = 1,
+  times = c(12, 24, 36),
+  iid = TRUE
+)
+plot(roc_train, time = 12, col = "blue", title = "RSF Time-dependent ROC (Elastic Net Features)")
+plot(roc_test, time = 12, add = TRUE, col = "red")
+legend("bottomright", legend = c("Train", "Test"), col = c("blue", "red"), lty = 1)
+text(0.6, 0.2, paste0("Train AUC = ", round(roc_train$AUC[1], 3)), col = "blue", cex = 0.9)
+text(0.6, 0.15, paste0("Test AUC = ", round(roc_test$AUC[1], 3)), col = "red", cex = 0.9)
+
+# --- 9. KM Plot by Risk Group (Test Set) ---
+median_risk <- median(test_pred_rsf)
+selected_test_df$risk_group <- ifelse(test_pred_rsf > median_risk, "High Risk", "Low Risk")
+fit_km_rsf <- survfit(Surv(OS, event_status) ~ risk_group, data = selected_test_df)
+ggsurvplot(fit_km_rsf, data = selected_test_df, pval = TRUE, risk.table = TRUE, title = "RSF: KM Curves by Risk Group")
