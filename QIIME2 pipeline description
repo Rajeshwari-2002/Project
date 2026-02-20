@@ -1,0 +1,95 @@
+#QIIME2 Taxonomic Profiling Pipeline
+Software Environment
+QIIME2: 2021.2
+DADA2 plugin (within QIIME2 2021.2)
+Classifier: SILVA 138 (99% OTUs, 515F–806R region)
+
+Raw FASTQ files (Single-End, Phred33)
+│
+├── 1. Data Import
+│   Tool: qiime tools import
+│   Output:
+│       demux.qza
+│
+├── 2. Quality Check
+│   Tool: qiime demux summarize
+│   Output:
+│       demux-summary.qzv
+│
+├── 3. Denoising (ASV Generation)
+│   Tool: qiime dada2 denoise-single
+│   Output:
+│       table-dada2.qza
+│       rep-seqs-dada2.qza
+│       denoising-stats.qza
+│
+├── 4. Feature Filtering (Low abundance removal)
+│   Tool: qiime feature-table filter-features
+│   Output:
+│       table-filtered.qza
+│
+├── 5. Feature Table Summary
+│   Tool: qiime feature-table summarize
+│   Output:
+│       table.qzv
+│
+├── 6. Taxonomic Classification
+│   Tool: qiime feature-classifier classify-sklearn
+│   Database: SILVA 138 (99%, 515–806)
+│   Output:
+│       taxonomy.qza
+│
+├── 7. Taxonomy Visualization
+│   Tool: qiime metadata tabulate
+│   Output:
+│       taxonomy.qzv
+│
+├── 8. Taxa Composition Barplots
+│   Tool: qiime taxa barplot
+│   Output:
+│       taxa-bar-plots.qzv
+│
+├── 9. Phylogenetic Tree Construction
+│   Tools:
+│       qiime alignment mafft
+│       qiime alignment mask
+│       qiime phylogeny fasttree
+│       qiime phylogeny midpoint-root
+│
+│   Outputs:
+│       aligned-rep-seqs.qza
+│       masked-aligned-rep-seqs.qza
+│       rooted-tree.qza
+│
+├── 10. Alpha & Beta Diversity Analysis
+│   Tool: qiime diversity core-metrics-phylogenetic
+│   Output Directory:
+│       core-metrics-results/
+│           shannon_vector.qza
+│           faith_pd_vector.qza
+│           weighted_unifrac_distance_matrix.qza
+│           weighted_unifrac_pcoa_results.qza
+│           etc.
+│
+├── 11. Alpha Diversity Significance
+│   Tool: qiime diversity alpha-group-significance
+│   Output:
+│       shannon-group-significance.qzv
+│
+├── 12. Beta Diversity Significance (PERMANOVA)
+│   Tool: qiime diversity beta-group-significance
+│   Output:
+│       weighted-unifrac-permanova.qzv
+│
+└── 13. PCoA Visualization
+    Tool: qiime emperor plot
+    Output:
+        weighted-unifrac-emperor.qzv
+
+#Final Key Output Files
+
+table-filtered.qza → Abundance table
+taxonomy.qza → Taxonomic assignments
+rooted-tree.qza → Phylogenetic tree
+core-metrics-results/ → Diversity metrics
+taxa-bar-plots.qzv → Composition visualization
