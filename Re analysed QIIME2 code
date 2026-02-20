@@ -1,1 +1,132 @@
+# 1. Activate QIIME2 Environment
 
+conda activate qiime2-2021.2
+
+# 2. Import FASTQ Files
+
+qiime tools import \
+  --type 'SampleData[SequencesWithQuality]' \
+  --input-path manifest.tsv \
+  --input-format SingleEndFastqManifestPhred33V2 \
+  --output-path demux.qza
+
+# 3. Visualize Quality
+
+qiime demux summarize \
+  --i-data demux.qza \
+  --o-visualization demux-summary.qzv
+
+# 4. DADA2 Denoising (ASV Generation)
+# NOTE: Adjust --p-trunc-len based on quality plot
+
+qiime dada2 denoise-single \
+  --i-demultiplexed-seqs demux.qza \
+  --p-trim-left 0 \
+  --p-trunc-len 227 \
+  --o-representative-sequences rep-seqs-dada2.qza \
+  --o-table table-dada2.qza \
+  --o-denoising-stats denoising-stats.qza
+
+# 5. Visualize Denoising Stats
+
+qiime metadata tabulate \
+  --m-input-file denoising-stats.qza \
+  --o-visualization denoising-stats.qzv
+
+# 6. Filter Low Abundance Features
+
+qiime feature-table filter-features \
+  --i-table table-dada2.qza \
+  --p-min-frequency 10 \
+  --o-filtered-table table-filtered.qza
+
+# 7. Summarize Feature Table
+
+qiime feature-table summarize \
+  --i-table table-filtered.qza \
+  --o-visualization table.qzv \
+  --m-sample-metadata-file sample_metadatas.tsv
+
+# 8. Taxonomic Classification (SILVA 138)
+
+qiime feature-classifier classify-sklearn \
+  --i-classifier silva-138-99-515-806-nb-classifier.qza \
+  --i-reads rep-seqs-dada2.qza \
+  --o-classification taxonomy.qza
+
+# 9. Visualize Taxonomy
+
+qiime metadata tabulate \
+  --m-input-file taxonomy.qza \
+  --o-visualization taxonomy.qzv
+
+# 10. Generate Taxa Barplots
+
+qiime taxa barplot \
+  --i-table table-filtered.qza \
+  --i-taxonomy taxonomy.qza \
+  --m-metadata-file sample_metadatas.tsv \
+  --o-visualization taxa-bar-plots.qzv
+
+# 11. Build Phylogenetic Tree
+
+qiime alignment mafft \
+  --i-sequences rep-seqs-dada2.qza \
+  --o-alignment aligned-rep-seqs.qza
+
+qiime alignment mask \
+  --i-alignment aligned-rep-seqs.qza \
+  --o-masked-alignment masked-aligned-rep-seqs.qza
+
+qiime phylogeny fasttree \
+  --i-alignment masked-aligned-rep-seqs.qza \
+  --o-tree unrooted-tree.qza
+
+qiime phylogeny midpoint-root \
+  --i-tree unrooted-tree.qza \
+  --o-rooted-tree rooted-tree.qza
+
+# 12. Diversity Analysis
+# NOTE: Adjust sampling depth based on table.qzv
+
+qiime diversity core-metrics-phylogenetic \
+  --i-phylogeny rooted-tree.qza \
+  --i-table table-filtered.qza \
+  --p-sampling-depth 5000 \
+  --m-metadata-file sample_metadatas.tsv \
+  --output-dir core-metrics-results
+
+# 13. Alpha Diversity Significance (Shannon)
+
+qiime diversity alpha-group-significance \
+  --i-alpha-diversity core-metrics-results/shannon_vector.qza \
+  --m-metadata-file sample_metadatas.tsv \
+  --o-visualization core-metrics-results/shannon-group-significance.qzv
+
+# 14. Beta Diversity Significance (PERMANOVA)
+
+qiime diversity beta-group-significance \
+  --i-distance-matrix core-metrics-results/weighted_unifrac_distance_matrix.qza \
+  --m-metadata-file sample_metadatas.tsv \
+  --m-metadata-column Stage \
+  --p-method permanova \
+  --o-visualization core-metrics-results/weighted-unifrac-permanova.qzv
+
+# 15. PCoA Visualization
+
+qiime emperor plot \
+  --i-pcoa core-metrics-results/weighted_unifrac_pcoa_results.qza \
+  --m-metadata-file sample_metadatas.tsv \
+  --o-visualization core-metrics-results/weighted-unifrac-emperor.qzv
+
+# 16. Differential Abundance (ANCOM)
+
+qiime composition add-pseudocount \
+  --i-table table-filtered.qza \
+  --o-composition-table comp-table.qza
+
+qiime composition ancom \
+  --i-table comp-table.qza \
+  --m-metadata-file sample_metadatas.tsv \
+  --m-metadata-column Stage \
+  --o-visualization ancom-Stage.qzv
