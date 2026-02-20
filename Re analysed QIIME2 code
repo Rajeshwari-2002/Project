@@ -130,3 +130,10 @@ qiime composition ancom \
   --m-metadata-file sample_metadatas.tsv \
   --m-metadata-column Stage \
   --o-visualization ancom-Stage.qzv
+
+#Output
+#table-filtered.qza → Abundance table
+#taxonomy.qza → Taxonomic assignments
+#rooted-tree.qza → Phylogenetic tree
+#core-metrics-results/ → Diversity metrics
+#taxa-bar-plots.qzv → Composition visualization
