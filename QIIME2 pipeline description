@@ -86,6 +86,8 @@ Raw FASTQ files (Single-End, Phred33)
     Output:
         weighted-unifrac-emperor.qzv
 
+#Can also add statistical analysis using PERMANOVA and defferential abundance analysis using ANCOM
+
 #Final Key Output Files
 
 table-filtered.qza → Abundance table
